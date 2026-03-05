@@ -17,8 +17,9 @@ from typing import Any
 
 import numpy as np
 import pytest
+from datasets import ClassLabel, Dataset, Features
+from datasets import Image as HFImage
 from PIL import Image
-from datasets import ClassLabel, Dataset, Features, Image as HFImage
 from transformers import ViTConfig, ViTForImageClassification, ViTImageProcessor, ViTModel
 
 from transformers_knn_adapter.knn_image_pipeline import pipeline
