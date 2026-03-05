@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 This changelog is automatically managed by release-please from commits merged into `main`.
 
+## [0.2.1](https://github.com/dimidagd/transformers-knn-adapter/compare/v0.2.0...v0.2.1) (2026-03-05)
+
+
+### Documentation
+
+* **code:** add docstrings to CLI helper functions ([c3fdf4a](https://github.com/dimidagd/transformers-knn-adapter/commit/c3fdf4af184514bb33cfba5becbe6ecd0b045ba8))
+* **readme:** add GitHub Actions badges for main workflows ([36ec158](https://github.com/dimidagd/transformers-knn-adapter/commit/36ec158e52fd77bbf9b9d6b5b6432fbee05b5639))
+
 ## [0.2.0](https://github.com/dimidagd/transformers-knn-adapter/compare/v0.1.0...v0.2.0) (2026-03-05)
 
 
