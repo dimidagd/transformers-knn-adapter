@@ -16,7 +16,7 @@ import os
 import tempfile
 from collections import Counter
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import joblib
 import numpy as np
@@ -80,7 +80,7 @@ class KNNImageClassificationPipeline(ImageClassificationPipeline):
     def _resolve_dataset(self, dataset: Any, split: str, streaming: bool = False) -> HFDataset | IterableDataset:
         if isinstance(dataset, str):
             try:
-                from datasets import load_dataset  # type: ignore
+                from datasets import load_dataset
             except Exception as exc:  # pragma: no cover - dependency/runtime detail
                 raise ImportError("`datasets` package is required when dataset is a string name.") from exc
             dataset_obj = load_dataset(dataset, split=split, streaming=streaming)
@@ -132,11 +132,17 @@ class KNNImageClassificationPipeline(ImageClassificationPipeline):
             batch_images = [self._coerce_image(image_value) for image_value in image_values]
             labels.extend(self._normalize_label(raw_label, label_names) for raw_label in label_values)
             loaded += len(label_values)
+            if self.image_processor is None:
+                raise ValueError("image_processor is not configured.")
             model_inputs = self.image_processor(images=batch_images, return_tensors="pt")
-            model_inputs = {k: v.to(self.device) if hasattr(v, "to") else v for k, v in model_inputs.items()}
+            model_inputs_on_device: dict[str, Any] = {
+                k: v.to(self.device) if hasattr(v, "to") else v for k, v in model_inputs.items()
+            }
 
+            if self.model is None:
+                raise ValueError("model is not configured.")
             with torch.inference_mode():
-                model_outputs = self.model(**model_inputs)
+                model_outputs = self.model(**model_inputs_on_device)
             embeddings = self._extract_embeddings(model_outputs).detach().cpu().numpy()
             if total_samples is not None:
                 if embeddings_mm is None:
@@ -484,9 +490,9 @@ class KNNImageClassificationPipeline(ImageClassificationPipeline):
     def _extract_embeddings(self, model_outputs: Any) -> torch.Tensor:
         """Extract a 2D embedding tensor from transformer model outputs."""
         if getattr(model_outputs, "pooler_output", None) is not None:
-            embeddings = model_outputs.pooler_output
+            embeddings = cast(torch.Tensor, model_outputs.pooler_output)
         elif getattr(model_outputs, "last_hidden_state", None) is not None:
-            embeddings = model_outputs.last_hidden_state[:, 0, :]
+            embeddings = cast(torch.Tensor, model_outputs.last_hidden_state[:, 0, :])
         else:
             raise ValueError("Model outputs do not contain pooler_output or last_hidden_state.")
         embeddings = embeddings.flatten(start_dim=1)
@@ -494,7 +500,7 @@ class KNNImageClassificationPipeline(ImageClassificationPipeline):
             raise ValueError(f"Expected 2D embeddings, got shape {tuple(embeddings.shape)}")
         return embeddings
 
-    def _forward(self, model_inputs: dict[str, Any], **forward_params: Any) -> dict[str, torch.Tensor]:
+    def _forward(self, model_inputs: dict[str, Any], **forward_params: Any) -> Any:
         if self.knn_model is None:
             raise ValueError("KNN head is not loaded. Provide knn_model_path or call train(...) first.")
         logger.debug("Running forward pass with KNN head")
@@ -507,13 +513,17 @@ class KNNImageClassificationPipeline(ImageClassificationPipeline):
 
     def postprocess(
         self,
-        model_outputs: dict[str, torch.Tensor],
+        model_outputs: Any,
         function_to_apply: str | None = None,
         top_k: int | None = 1,
         _legacy: bool = True,
-    ) -> list[dict[str, float | str]] | list[list[dict[str, float | str]]]:
+        **postprocess_parameters: Any,
+    ) -> Any:
         # function_to_apply is ignored because KNN returns calibrated probabilities.
         del function_to_apply, _legacy
+        del postprocess_parameters
+        if self.knn_model is None:
+            raise ValueError("KNN head is not loaded. Provide knn_model_path or call train(...) first.")
 
         probs = model_outputs["probs"]
         if probs.ndim == 1:
@@ -528,7 +538,7 @@ class KNNImageClassificationPipeline(ImageClassificationPipeline):
         batched_results: list[list[dict[str, float | str]]] = []
         for row in probs:
             values, indices = torch.topk(row, k=top_k)
-            results = [
+            results: list[dict[str, float | str]] = [
                 {"label": str(classes[int(idx)]), "score": float(score)}
                 for score, idx in zip(values.tolist(), indices.tolist(), strict=True)
             ]
