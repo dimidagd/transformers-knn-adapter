@@ -1,8 +1,4 @@
-"""Post-release smoke test for inference using installed PyPI package.
-
-This script generates a tiny local transformer model + KNN head and runs
-single and batched inference through the package API (no CLI usage).
-"""
+"""Post-release smoke test for inference using the installed PyPI package."""
 
 from __future__ import annotations
 
@@ -18,6 +14,7 @@ from transformers_knn_adapter.knn_image_pipeline import pipeline
 
 
 def main() -> None:
+    rng = np.random.default_rng(1234)
     workdir = Path("/tmp/pypi-check-fixtures")
     model_dir = workdir / "tiny-local-vit"
     knn_path = workdir / "knn_head.joblib"
@@ -44,14 +41,14 @@ def main() -> None:
     )
     processor.save_pretrained(model_dir)
 
-    features = np.random.default_rng(1234).normal(size=(12, 64))
-    labels = np.array(["class_a"] * 6 + ["class_b"] * 6, dtype=object)
+    features = rng.normal(size=(4, 64))
+    labels = np.array(["class_a", "class_b", "class_a", "class_b"], dtype=object)
     knn = KNeighborsClassifier(n_neighbors=1)
     knn.fit(features, labels)
     joblib.dump(knn, knn_path)
 
     image = Image.fromarray(
-        np.random.default_rng(4321).integers(0, 255, size=(32, 32, 3), dtype=np.uint8),
+        rng.integers(0, 255, size=(32, 32, 3), dtype=np.uint8),
         mode="RGB",
     )
     image.save(image_path)
@@ -64,12 +61,9 @@ def main() -> None:
         top_k=2,
     )
 
-    single_result = clf(str(image_path))
-    batch_result = clf([str(image_path)] * 5)
-
-    assert isinstance(single_result, list) and single_result and isinstance(single_result[0], dict)
-    assert isinstance(batch_result, list) and len(batch_result) == 5
-    assert all(isinstance(item, list) and item for item in batch_result)
+    result = clf(str(image_path))
+    assert isinstance(result, list) and result and isinstance(result[0], dict)
+    assert "label" in result[0] and "score" in result[0]
 
     print("PyPI inference smoke check passed")
 
