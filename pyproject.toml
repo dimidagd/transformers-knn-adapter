@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "transformers_knn_adapter"
-version = "0.1.0"
+version = "0.2.0"
 description = "Hugging Face Transformers image embedding adapter with a scikit-learn KNN classification head."
 readme = "README.md"
 requires-python = ">=3.10"
