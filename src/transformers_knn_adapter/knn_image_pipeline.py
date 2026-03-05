@@ -579,6 +579,7 @@ __all__ = ["KNNImageClassificationPipeline", "pipeline"]
 
 
 def _validate_cli_train_args(args: argparse.Namespace) -> None:
+    """Validate CLI argument combinations for training-related commands."""
     if args.grid_search and args.n_neighbors is not None:
         raise ValueError("--n-neighbors is mutually exclusive with --grid-search.")
     if args.grid_search_splits is not None and not args.grid_search:
@@ -592,6 +593,7 @@ def _validate_cli_train_args(args: argparse.Namespace) -> None:
 
 
 def _train_pipeline_from_args(args: argparse.Namespace) -> KNNImageClassificationPipeline:
+    """Build and train a pipeline instance from parsed CLI arguments."""
     _validate_cli_train_args(args)
 
     clf = pipeline(
@@ -632,12 +634,14 @@ def _train_pipeline_from_args(args: argparse.Namespace) -> KNNImageClassificatio
 
 
 def _run_cli_train(args: argparse.Namespace) -> None:
+    """Handle the `train` CLI command."""
     _train_pipeline_from_args(args)
 
     logger.info("Training complete. Saved KNN model to %s", args.knn_model_path)
 
 
 def _run_cli_infer(args: argparse.Namespace) -> None:
+    """Handle the `infer` CLI command using an already-trained KNN model."""
     if args.inference_batch_size <= 0:
         raise ValueError("--inference-batch-size must be > 0.")
     clf = pipeline(
@@ -658,6 +662,7 @@ def _run_cli_infer(args: argparse.Namespace) -> None:
 
 
 def _run_cli_predict(args: argparse.Namespace) -> None:
+    """Handle the `predict` CLI command."""
     clf = pipeline(
         "image-classification",
         model_path=args.model,
@@ -670,6 +675,7 @@ def _run_cli_predict(args: argparse.Namespace) -> None:
 
 
 def _run_cli_eval(args: argparse.Namespace) -> None:
+    """Handle the `eval` CLI command."""
     clf = pipeline(
         "image-classification",
         model_path=args.model,
@@ -694,6 +700,7 @@ def _run_cli_eval(args: argparse.Namespace) -> None:
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
+    """Build and return the CLI argument parser."""
     parser = argparse.ArgumentParser(description="KNN image pipeline CLI.")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -807,6 +814,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
+    """CLI entrypoint."""
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
