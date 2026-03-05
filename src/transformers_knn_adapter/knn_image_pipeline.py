@@ -14,20 +14,21 @@ import logging
 import math
 import os
 import tempfile
+from collections import Counter
 from pathlib import Path
 from typing import Any
-from collections import Counter
 
 import joblib
 import numpy as np
 import torch
+from datasets import Dataset as HFDataset
+from datasets import IterableDataset
+from PIL import Image
 from sklearn.base import ClassifierMixin
 from sklearn.metrics import classification_report
-from sklearn.neighbors import KNeighborsClassifier
 from sklearn.model_selection import GridSearchCV, RepeatedStratifiedKFold
+from sklearn.neighbors import KNeighborsClassifier
 from tqdm.auto import tqdm
-from PIL import Image
-from datasets import Dataset as HFDataset, IterableDataset
 from transformers import AutoImageProcessor, AutoModel
 from transformers.pipelines import ImageClassificationPipeline
 
