@@ -568,7 +568,7 @@ def pipeline(
 __all__ = ["KNNImageClassificationPipeline", "pipeline"]
 
 
-def _run_cli_train(args: argparse.Namespace) -> None:
+def _validate_cli_train_args(args: argparse.Namespace) -> None:
     if args.grid_search and args.n_neighbors is not None:
         raise ValueError("--n-neighbors is mutually exclusive with --grid-search.")
     if args.grid_search_splits is not None and not args.grid_search:
@@ -579,6 +579,10 @@ def _run_cli_train(args: argparse.Namespace) -> None:
         raise ValueError("--grid-search-scoring can only be used with --grid-search.")
     if args.grid_search and args.grid_search_scoring is None:
         raise ValueError("--grid-search-scoring is required when --grid-search is enabled.")
+
+
+def _train_pipeline_from_args(args: argparse.Namespace) -> KNNImageClassificationPipeline:
+    _validate_cli_train_args(args)
 
     clf = pipeline(
         "image-classification",
@@ -614,8 +618,33 @@ def _run_cli_train(args: argparse.Namespace) -> None:
         grid_search_scoring=args.grid_search_scoring,
         save_knn_model_path=args.knn_model_path,
     )
+    return clf
+
+
+def _run_cli_train(args: argparse.Namespace) -> None:
+    _train_pipeline_from_args(args)
 
     logger.info("Training complete. Saved KNN model to %s", args.knn_model_path)
+
+
+def _run_cli_infer(args: argparse.Namespace) -> None:
+    if args.inference_batch_size <= 0:
+        raise ValueError("--inference-batch-size must be > 0.")
+    clf = pipeline(
+        "image-classification",
+        model_path=args.model,
+        knn_model_path=args.knn_model_path,
+        device=args.device,
+        top_k=args.top_k,
+    )
+    image_input = args.image
+    image_batch = [image_input for _ in range(args.inference_batch_size)]
+    single_result = clf(image_input)
+    batch_result = clf(image_batch)
+    logger.info("Single-image inference input: %s", image_input)
+    logger.info("Single-image inference result: %s", single_result)
+    logger.info("Batch inference URLs (count=%d): %s", args.inference_batch_size, image_batch)
+    logger.info("Batch inference result: %s", batch_result)
 
 
 def _run_cli_predict(args: argparse.Namespace) -> None:
@@ -710,6 +739,26 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     train_parser.add_argument("--top-k", type=int, default=2, help="Top-k at inference time.")
     train_parser.add_argument("--device", type=int, default=-1, help="Transformers device index (-1 for CPU).")
 
+    infer_parser = subparsers.add_parser(
+        "infer",
+        help="Run inference on one image and a list of images using a trained KNN head.",
+    )
+    infer_parser.add_argument("--model", required=True, help="HF model id/path for feature extraction.")
+    infer_parser.add_argument("--knn-model-path", required=True, help="Path to save/load KNN model (.joblib).")
+    infer_parser.add_argument("--top-k", type=int, default=3, help="Top-k predictions.")
+    infer_parser.add_argument("--device", type=int, default=-1, help="Transformers device index (-1 for CPU).")
+    infer_parser.add_argument(
+        "--image",
+        default="https://picsum.photos/200",
+        help="Image input used for single and batched inference (file path or URL).",
+    )
+    infer_parser.add_argument(
+        "--inference-batch-size",
+        type=int,
+        default=5,
+        help="Number of images to send as batched inference requests.",
+    )
+
     predict_parser = subparsers.add_parser("predict", help="Run inference using trained KNN head.")
     predict_parser.add_argument("--model", required=True, help="HF model id/path for feature extraction.")
     predict_parser.add_argument("--knn-model-path", required=True, help="Path to trained KNN model (.joblib).")
@@ -755,6 +804,8 @@ def main() -> None:
     args = parser.parse_args()
     if args.command == "train":
         _run_cli_train(args)
+    elif args.command == "infer":
+        _run_cli_infer(args)
     elif args.command == "predict":
         _run_cli_predict(args)
     elif args.command == "eval":
