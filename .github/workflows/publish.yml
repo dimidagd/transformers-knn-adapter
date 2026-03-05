@@ -35,3 +35,97 @@ jobs:
 
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
+
+  post-release-checks:
+    needs: pypi
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install released package from PyPI
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          python -m venv /tmp/pypi-check
+          source /tmp/pypi-check/bin/activate
+          python -m pip install --upgrade pip
+          for i in {1..12}; do
+            if python -m pip install "transformers-knn-adapter==${VERSION}"; then
+              break
+            fi
+            if [[ "$i" -eq 12 ]]; then
+              echo "Failed to install transformers-knn-adapter==${VERSION} from PyPI after retries."
+              exit 1
+            fi
+            echo "PyPI release not visible yet (attempt $i/12). Retrying in 20s..."
+            sleep 20
+          done
+
+      - name: Build local inference fixtures
+        shell: bash
+        run: |
+          set -euo pipefail
+          source /tmp/pypi-check/bin/activate
+          python <<'PY'
+          from pathlib import Path
+
+          import joblib
+          import numpy as np
+          from PIL import Image
+          from sklearn.neighbors import KNeighborsClassifier
+          from transformers import ViTConfig, ViTImageProcessor, ViTModel
+
+          workdir = Path("/tmp/pypi-check-fixtures")
+          model_dir = workdir / "tiny-local-vit"
+          model_dir.mkdir(parents=True, exist_ok=True)
+
+          config = ViTConfig(
+              image_size=32,
+              patch_size=16,
+              num_channels=3,
+              hidden_size=64,
+              intermediate_size=128,
+              num_hidden_layers=2,
+              num_attention_heads=4,
+          )
+          model = ViTModel(config)
+          model.save_pretrained(model_dir)
+
+          processor = ViTImageProcessor(
+              do_resize=True,
+              size={"height": 32, "width": 32},
+              do_rescale=True,
+              do_normalize=False,
+          )
+          processor.save_pretrained(model_dir)
+
+          X = np.random.default_rng(1234).normal(size=(12, 64))
+          y = np.array(["class_a"] * 6 + ["class_b"] * 6, dtype=object)
+          knn = KNeighborsClassifier(n_neighbors=1)
+          knn.fit(X, y)
+          joblib.dump(knn, workdir / "knn_head.joblib")
+
+          image = Image.fromarray(
+              np.random.default_rng(4321).integers(0, 255, size=(32, 32, 3), dtype=np.uint8),
+              mode="RGB",
+          )
+          image.save(workdir / "fake-image.png")
+          PY
+
+      - name: Run CLI inference smoke test
+        shell: bash
+        run: |
+          set -euo pipefail
+          source /tmp/pypi-check/bin/activate
+          python -m transformers_knn_adapter.knn_image_pipeline infer \
+            --model /tmp/pypi-check-fixtures/tiny-local-vit \
+            --knn-model-path /tmp/pypi-check-fixtures/knn_head.joblib \
+            --image /tmp/pypi-check-fixtures/fake-image.png \
+            --top-k 2 \
+            --inference-batch-size 5
