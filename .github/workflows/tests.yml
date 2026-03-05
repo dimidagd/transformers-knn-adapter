@@ -20,15 +20,33 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Select matrix mode
+        id: matrix_mode
+        run: |
+          if [[ "${{ github.event_name }}" == "pull_request" && "${{ startsWith(github.head_ref, 'release-please--') }}" != "true" && "${{ matrix.python-version }}" != "3.12" ]]; then
+            echo "run_full=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "run_full=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Skip full test flow for non-latest Python on regular PRs
+        if: ${{ steps.matrix_mode.outputs.run_full != 'true' }}
+        run: |
+          echo "Regular PR detected; running full checks only on Python 3.12."
+          echo "This matrix job is intentionally skipped."
+
       - name: Set up Python
+        if: ${{ steps.matrix_mode.outputs.run_full == 'true' }}
         uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
 
       - name: Install uv
+        if: ${{ steps.matrix_mode.outputs.run_full == 'true' }}
         uses: astral-sh/setup-uv@v5
 
       - name: Cache uv downloads
+        if: ${{ steps.matrix_mode.outputs.run_full == 'true' }}
         uses: actions/cache@v4
         with:
           path: ${{ env.UV_CACHE_DIR }}
@@ -38,18 +56,23 @@ jobs:
             uv-${{ runner.os }}-
 
       - name: Sync dependencies
+        if: ${{ steps.matrix_mode.outputs.run_full == 'true' }}
         run: uv sync --dev
 
       - name: Run ruff
+        if: ${{ steps.matrix_mode.outputs.run_full == 'true' }}
         run: uv run ruff check .
 
       - name: Run pytest
+        if: ${{ steps.matrix_mode.outputs.run_full == 'true' }}
         run: uv run pytest -q
 
       - name: Build wheel
+        if: ${{ steps.matrix_mode.outputs.run_full == 'true' }}
         run: uv build --wheel
 
       - name: Install smoke test
+        if: ${{ steps.matrix_mode.outputs.run_full == 'true' }}
         run: |
           uv venv --clear /tmp/install-smoke
           uv pip install --python /tmp/install-smoke/bin/python dist/*.whl
