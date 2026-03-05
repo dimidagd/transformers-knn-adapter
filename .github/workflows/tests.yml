@@ -34,3 +34,12 @@ jobs:
 
       - name: Run pytest
         run: uv run pytest -q
+
+      - name: Build wheel
+        run: uv build --wheel
+
+      - name: Install smoke test
+        run: |
+          uv venv --clear /tmp/install-smoke
+          uv pip install --python /tmp/install-smoke/bin/python dist/*.whl
+          /tmp/install-smoke/bin/python -c "import transformers_knn_adapter; print('install-ok')"
