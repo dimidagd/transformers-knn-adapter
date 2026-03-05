@@ -9,6 +9,7 @@ How to run:
 
 from __future__ import annotations
 
+import argparse
 import logging
 import tempfile
 from collections.abc import Callable
@@ -22,6 +23,7 @@ from datasets import Image as HFImage
 from PIL import Image
 from transformers import ViTConfig, ViTForImageClassification, ViTImageProcessor, ViTModel
 
+import transformers_knn_adapter.knn_image_pipeline as knn_image_pipeline_module
 from transformers_knn_adapter.knn_image_pipeline import pipeline
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -522,3 +524,38 @@ def test_evaluate_sampling_modes_with_max_samples(
         ),
     )
     assert true_labels == expected_true_labels
+
+
+def test_cli_infer_mode_with_local_fake_image(
+    pipeline_factory,
+    rng: np.random.Generator,
+    caplog: pytest.LogCaptureFixture,
+    model_class: type[ViTModel] | type[ViTForImageClassification],
+) -> None:
+    """Infer CLI mode should run on a local image path after separate training."""
+    dataset, sample_image = get_hf_dataset(rng=rng, num_samples=40)
+    case = _run_training_case(
+        pipeline_factory=pipeline_factory,
+        dataset=dataset,
+        model_class=model_class,
+        train_kwargs={"max_samples": 40, "shuffle": True, "shuffle_seed": TEST_SHUFFLE_SEED},
+    )
+    knn_path = case["knn_path"]
+    model_dir = knn_path.parent / "tiny-local-vit"
+    fake_image_path = knn_path.parent / "fake-image.png"
+    sample_image.save(fake_image_path)
+
+    caplog.set_level(logging.INFO)
+    knn_image_pipeline_module._run_cli_infer(
+        argparse.Namespace(
+            model=str(model_dir),
+            knn_model_path=str(knn_path),
+            top_k=2,
+            device=-1,
+            image=str(fake_image_path),
+            inference_batch_size=5,
+        )
+    )
+
+    assert "Single-image inference result" in caplog.text
+    assert "Batch inference result" in caplog.text
