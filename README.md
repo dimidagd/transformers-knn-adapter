@@ -1,5 +1,9 @@
 # transformers-knn-adapter
 
+[![tests](https://github.com/dimidagd/transformers-knn-adapter/actions/workflows/tests.yml/badge.svg?branch=main)](https://github.com/dimidagd/transformers-knn-adapter/actions/workflows/tests.yml)
+[![release-please](https://github.com/dimidagd/transformers-knn-adapter/actions/workflows/release-please.yml/badge.svg?branch=main)](https://github.com/dimidagd/transformers-knn-adapter/actions/workflows/release-please.yml)
+[![publish](https://github.com/dimidagd/transformers-knn-adapter/actions/workflows/publish.yml/badge.svg?branch=main)](https://github.com/dimidagd/transformers-knn-adapter/actions/workflows/publish.yml)
+
 `transformers_knn_adapter` extends Hugging Face image models by attaching a scikit-learn KNN classifier on top of transformer embeddings.
 
 ## Requirements
