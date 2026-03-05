@@ -7,7 +7,7 @@ name = "transformers_knn_adapter"
 version = "0.1.0"
 description = "Hugging Face Transformers image embedding adapter with a scikit-learn KNN classification head."
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [{ name = "transformers-knn-adapter contributors" }]
 dependencies = [
@@ -36,7 +36,7 @@ python_files = ["test_*.py"]
 addopts = "-q"
 
 [tool.ruff]
-target-version = "py311"
+target-version = "py310"
 line-length = 120
 src = ["src", "tests"]
 
