@@ -49,6 +49,16 @@ uv run python -m transformers_knn_adapter.knn_image_pipeline eval \
   --batch-size 100
 ```
 
+## Inference
+
+```bash
+uv run python -m transformers_knn_adapter.knn_image_pipeline infer \
+  --model microsoft/resnet-50 \
+  --knn-model-path /tmp/knn/dinov2_small_mini_imagenet_full.joblib \
+  --image https://picsum.photos/200 \
+  --inference-batch-size 5
+```
+
 ## Python API
 
 ```python
