@@ -43,8 +43,11 @@ jobs:
       - name: Run ruff
         run: uv run ruff check .
 
+      - name: Run mypy
+        run: uv run mypy
+
       - name: Run pytest
-        run: uv run pytest -q
+        run: uv run pytest --cov=transformers_knn_adapter --cov-report=term-missing --cov-fail-under=60
 
       - name: Build wheel
         run: uv build --wheel
