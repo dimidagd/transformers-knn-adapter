@@ -144,6 +144,23 @@ def get_hf_dataset(rng: np.random.Generator, num_samples: int = 100) -> tuple[Da
     return Dataset.from_list(rows, features=features), rows[0]["image"]
 
 
+def _build_local_imagefolder_dataset(
+    root: Path,
+    rng: np.random.Generator,
+    *,
+    samples_per_class: int = 8,
+) -> Path:
+    """Create an on-disk imagefolder dataset with one subdirectory per class."""
+    root.mkdir(parents=True, exist_ok=True)
+    for class_name in EXPECTED_CLASSES:
+        class_dir = root / class_name
+        class_dir.mkdir(parents=True, exist_ok=True)
+        for idx in range(samples_per_class):
+            image = Image.fromarray(rng.integers(0, 255, size=(32, 32, 3), dtype=np.uint8), mode="RGB")
+            image.save(class_dir / f"{class_name}_{idx}.png")
+    return root
+
+
 def _build_ordered_dataset(
     rng: np.random.Generator,
     *,
@@ -432,6 +449,34 @@ def test_train_streaming_iterable_dataset(
     )
     _assert_artifact_and_model(case)
     _assert_knn_classes(case["clf"], set(EXPECTED_CLASSES))
+
+
+def test_train_and_evaluate_with_local_imagefolder_path(
+    tmp_path: Path,
+    rng: np.random.Generator,
+) -> None:
+    """Train/evaluate should support existing local imagefolder dataset paths."""
+    clf, _ = _build_local_pipeline(tmp_path, model_class=ViTModel)
+    dataset_dir = _build_local_imagefolder_dataset(tmp_path / "imagefolder", rng=rng, samples_per_class=6)
+
+    clf.train(
+        dataset=str(dataset_dir),
+        split="train",
+        image_column="image",
+        label_column="label",
+        batch_size=4,
+        n_neighbors=1,
+    )
+
+    metrics = clf.evaluate(
+        dataset=str(dataset_dir),
+        split="train",
+        image_column="image",
+        label_column="label",
+        batch_size=4,
+    )
+    assert metrics["samples"] == len(EXPECTED_CLASSES) * 6
+    assert set(metrics["true_label_counts"]) == set(EXPECTED_CLASSES)
 
 
 def test_train_with_grid_search_selects_knn_hyperparameters(

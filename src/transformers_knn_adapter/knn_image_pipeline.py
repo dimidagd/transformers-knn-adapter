@@ -78,12 +78,17 @@ class KNNImageClassificationPipeline(ImageClassificationPipeline):
         raise TypeError(f"Unsupported image type: {type(image_value)!r}")
 
     def _resolve_dataset(self, dataset: Any, split: str, streaming: bool = False) -> HFDataset | IterableDataset:
-        if isinstance(dataset, str):
+        if isinstance(dataset, (str, os.PathLike)):
+            dataset_ref = os.fspath(dataset)
             try:
                 from datasets import load_dataset
             except Exception as exc:  # pragma: no cover - dependency/runtime detail
                 raise ImportError("`datasets` package is required when dataset is a string name.") from exc
-            dataset_obj = load_dataset(dataset, split=split, streaming=streaming)
+            dataset_path = Path(dataset_ref).expanduser()
+            if dataset_path.is_dir():
+                dataset_obj = load_dataset("imagefolder", data_dir=str(dataset_path), split=split, streaming=streaming)
+            else:
+                dataset_obj = load_dataset(dataset_ref, split=split, streaming=streaming)
             if not isinstance(dataset_obj, (HFDataset, IterableDataset)):
                 raise TypeError("Only Hugging Face Dataset/IterableDataset is supported.")
             return dataset_obj
@@ -277,6 +282,7 @@ class KNNImageClassificationPipeline(ImageClassificationPipeline):
 
         `dataset` can be:
         - a Hugging Face dataset name (e.g. ``"timm/mini-imagenet"``), or
+        - a local directory path for `imagefolder` data, or
         - a loaded `datasets.Dataset` / `datasets.DatasetDict`, or
         - a loaded `datasets.IterableDataset` / `datasets.IterableDatasetDict`.
         """
@@ -707,7 +713,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     train_parser = subparsers.add_parser("train", help="Train KNN head and save it.")
     train_parser.add_argument("--model", required=True, help="HF model id/path for feature extraction.")
     train_parser.add_argument("--knn-model-path", required=True, help="Path to save/load KNN model (.joblib).")
-    train_parser.add_argument("--dataset", required=True, help="HF dataset name (example: timm/mini-imagenet).")
+    train_parser.add_argument(
+        "--dataset",
+        required=True,
+        help="HF dataset name (example: timm/mini-imagenet) or local imagefolder path.",
+    )
     train_parser.add_argument("--split", default="train", help="Dataset split when --dataset is provided.")
     train_parser.add_argument("--image-column", default="image", help="Dataset image column.")
     train_parser.add_argument("--label-column", default="label", help="Dataset label column.")
@@ -786,7 +796,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     eval_parser = subparsers.add_parser("eval", help="Evaluate trained KNN head on a dataset split.")
     eval_parser.add_argument("--model", required=True, help="HF model id/path for feature extraction.")
     eval_parser.add_argument("--knn-model-path", required=True, help="Path to trained KNN model (.joblib).")
-    eval_parser.add_argument("--dataset", required=True, help="HF dataset name (example: timm/mini-imagenet).")
+    eval_parser.add_argument(
+        "--dataset",
+        required=True,
+        help="HF dataset name (example: timm/mini-imagenet) or local imagefolder path.",
+    )
     eval_parser.add_argument("--split", default="validation", help="Dataset split.")
     eval_parser.add_argument("--image-column", default="image", help="Dataset image column.")
     eval_parser.add_argument("--label-column", default="label", help="Dataset label column.")
