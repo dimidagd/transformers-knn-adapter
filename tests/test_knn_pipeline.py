@@ -482,6 +482,19 @@ def test_pad_image_to_square_returns_square_with_black_padding() -> None:
     assert padded.getpixel((5, 5)) == (255, 0, 0)
 
 
+def test_clone_channel_to_rgb_keeps_only_selected_channel() -> None:
+    """Channel cloning should replicate selected channel and discard others."""
+    image = Image.new("RGB", (1, 1), (10, 120, 250))
+
+    red_only = KNNImageClassificationPipeline._clone_channel_to_rgb(image, "R")
+    green_only = KNNImageClassificationPipeline._clone_channel_to_rgb(image, "G")
+    blue_only = KNNImageClassificationPipeline._clone_channel_to_rgb(image, "B")
+
+    assert red_only.getpixel((0, 0)) == (10, 10, 10)
+    assert green_only.getpixel((0, 0)) == (120, 120, 120)
+    assert blue_only.getpixel((0, 0)) == (250, 250, 250)
+
+
 def test_train_and_evaluate_with_local_imagefolder_path(
     tmp_path: Path,
     rng: np.random.Generator,

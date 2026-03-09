@@ -46,11 +46,13 @@ class KNNImageClassificationPipeline(ImageClassificationPipeline):
         *args: Any,
         knn_model_path: str | Path,
         pad_to_square: bool = False,
+        skip_channel_information: str | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(*args, **kwargs)
         self.knn_model_path = str(knn_model_path)
         self.pad_to_square = pad_to_square
+        self.skip_channel_information = skip_channel_information
         self.knn_model: ClassifierMixin | None = None
         if Path(self.knn_model_path).exists():
             logger.info("Loading KNN model from %s", self.knn_model_path)
@@ -94,8 +96,25 @@ class KNNImageClassificationPipeline(ImageClassificationPipeline):
         canvas.paste(image, (offset_x, offset_y))
         return canvas
 
-    def _prepare_image(self, image_value: Any, *, pad_to_square: bool) -> Image.Image:
+    @staticmethod
+    def _clone_channel_to_rgb(image: Image.Image, channel: str) -> Image.Image:
+        channel_to_index = {"R": 0, "G": 1, "B": 2}
+        if channel not in channel_to_index:
+            raise ValueError("skip_channel_information must be one of: R, G, B.")
+        rgb_image = image.convert("RGB")
+        source = rgb_image.split()[channel_to_index[channel]]
+        return Image.merge("RGB", (source, source, source))
+
+    def _prepare_image(
+        self,
+        image_value: Any,
+        *,
+        pad_to_square: bool,
+        skip_channel_information: str | None,
+    ) -> Image.Image:
         image = self._coerce_image(image_value)
+        if skip_channel_information is not None:
+            image = self._clone_channel_to_rgb(image, skip_channel_information)
         if pad_to_square:
             return self._pad_image_to_square(image)
         return image
@@ -105,16 +124,33 @@ class KNNImageClassificationPipeline(ImageClassificationPipeline):
             return self.pad_to_square
         return bool(pad_to_square)
 
+    def _resolve_skip_channel_information(self, skip_channel_information: str | None) -> str | None:
+        if skip_channel_information is None:
+            return self.skip_channel_information
+        if skip_channel_information not in {"R", "G", "B"}:
+            raise ValueError("skip_channel_information must be one of: R, G, B.")
+        return skip_channel_information
+
     def _sanitize_parameters(self, **kwargs: Any) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
         custom_pad = kwargs.pop("pad_to_square", None)
+        custom_skip_channel = kwargs.pop("skip_channel_information", None)
         preprocess_params, forward_params, postprocess_params = super()._sanitize_parameters(**kwargs)
         if custom_pad is not None:
             preprocess_params["pad_to_square"] = bool(custom_pad)
+        if custom_skip_channel is not None:
+            preprocess_params["skip_channel_information"] = str(custom_skip_channel)
         return preprocess_params, forward_params, postprocess_params
 
     def preprocess(self, image: Any, **preprocess_params: Any) -> dict[str, Any]:
         pad_to_square = bool(preprocess_params.pop("pad_to_square", self.pad_to_square))
-        prepared_image = self._prepare_image(image, pad_to_square=pad_to_square)
+        skip_channel_information = self._resolve_skip_channel_information(
+            preprocess_params.pop("skip_channel_information", None)
+        )
+        prepared_image = self._prepare_image(
+            image,
+            pad_to_square=pad_to_square,
+            skip_channel_information=skip_channel_information,
+        )
         return super().preprocess(prepared_image, **preprocess_params)
 
     def _resolve_dataset(self, dataset: Any, split: str, streaming: bool = False) -> HFDataset | IterableDataset:
@@ -284,6 +320,7 @@ class KNNImageClassificationPipeline(ImageClassificationPipeline):
         max_samples: int | None,
         label_names: list[str] | None,
         pad_to_square: bool,
+        skip_channel_information: str | None,
     ) -> tuple[np.ndarray, np.ndarray, np.memmap | None, str | None, int]:
         """Extract embeddings and labels, optionally using memmap storage for known sample counts."""
         self.model.eval()
@@ -305,7 +342,14 @@ class KNNImageClassificationPipeline(ImageClassificationPipeline):
         ):
             image_values = batch[image_column]
             label_values = batch[label_column]
-            batch_images = [self._prepare_image(image_value, pad_to_square=pad_to_square) for image_value in image_values]
+            batch_images = [
+                self._prepare_image(
+                    image_value,
+                    pad_to_square=pad_to_square,
+                    skip_channel_information=skip_channel_information,
+                )
+                for image_value in image_values
+            ]
             labels.extend(self._normalize_label(raw_label, label_names) for raw_label in label_values)
             loaded += len(label_values)
             if self.image_processor is None:
@@ -448,6 +492,7 @@ class KNNImageClassificationPipeline(ImageClassificationPipeline):
         grid_search_repeats: int = 2,
         grid_search_scoring: str | None = None,
         pad_to_square: bool | None = None,
+        skip_channel_information: str | None = None,
         save_knn_model_path: str | Path | None = None,
     ) -> ClassifierMixin:
         """Train and attach a KNN head from extracted embeddings.
@@ -482,6 +527,7 @@ class KNNImageClassificationPipeline(ImageClassificationPipeline):
         if streaming and stratified:
             raise ValueError("stratified mode is only supported when streaming=False.")
         resolved_pad_to_square = self._resolve_pad_to_square(pad_to_square)
+        resolved_skip_channel_information = self._resolve_skip_channel_information(skip_channel_information)
 
         logger.info(
             "Starting KNN training: split=%s image_column=%s label_column=%s batch_size=%d n_neighbors=%d streaming=%s stratified=%s shuffle=%s shuffle_seed=%d max_samples=%s",
@@ -531,6 +577,7 @@ class KNNImageClassificationPipeline(ImageClassificationPipeline):
             max_samples=max_samples,
             label_names=label_names,
             pad_to_square=resolved_pad_to_square,
+            skip_channel_information=resolved_skip_channel_information,
         )
 
         try:
@@ -584,6 +631,7 @@ class KNNImageClassificationPipeline(ImageClassificationPipeline):
         negative_classes: tuple[str, ...] = ("other",),
         positive_classes_population_ratio: float | None = None,
         pad_to_square: bool | None = None,
+        skip_channel_information: str | None = None,
     ) -> dict[str, Any]:
         """Evaluate top-1 accuracy on a dataset or dataset split."""
         if self.knn_model is None:
@@ -606,6 +654,7 @@ class KNNImageClassificationPipeline(ImageClassificationPipeline):
                 "(class-aware filtering/subsampling needs materialized datasets)."
             )
         resolved_pad_to_square = self._resolve_pad_to_square(pad_to_square)
+        resolved_skip_channel_information = self._resolve_skip_channel_information(skip_channel_information)
         dataset_obj = self._resolve_dataset(dataset=dataset, split=split, streaming=streaming)
         if stratified:
             if not isinstance(dataset_obj, HFDataset):
@@ -657,9 +706,18 @@ class KNNImageClassificationPipeline(ImageClassificationPipeline):
             image_values = batch[image_column]
             label_values = batch[label_column]
             batch_images = [
-                self._prepare_image(image_value, pad_to_square=resolved_pad_to_square) for image_value in image_values
+                self._prepare_image(
+                    image_value,
+                    pad_to_square=resolved_pad_to_square,
+                    skip_channel_information=resolved_skip_channel_information,
+                )
+                for image_value in image_values
             ]
-            batch_pred = self(batch_images, pad_to_square=resolved_pad_to_square)
+            batch_pred = self(
+                batch_images,
+                pad_to_square=resolved_pad_to_square,
+                skip_channel_information=resolved_skip_channel_information,
+            )
 
             if batch_pred and isinstance(batch_pred[0], dict):
                 pred_labels = [str(batch_pred[0]["label"])]
@@ -804,6 +862,7 @@ def _train_pipeline_from_args(args: argparse.Namespace) -> KNNImageClassificatio
     """Build and train a pipeline instance from parsed CLI arguments."""
     _validate_cli_train_args(args)
     pad_to_square = bool(getattr(args, "pad_to_square", False))
+    skip_channel_information = cast(str | None, getattr(args, "skip_channel_information", None))
 
     clf = pipeline(
         "image-classification",
@@ -812,6 +871,7 @@ def _train_pipeline_from_args(args: argparse.Namespace) -> KNNImageClassificatio
         device=args.device,
         top_k=args.top_k,
         pad_to_square=pad_to_square,
+        skip_channel_information=skip_channel_information,
     )
 
     logger.info(
@@ -839,6 +899,7 @@ def _train_pipeline_from_args(args: argparse.Namespace) -> KNNImageClassificatio
         grid_search_repeats=args.grid_search_repeats if args.grid_search_repeats is not None else 2,
         grid_search_scoring=args.grid_search_scoring,
         pad_to_square=pad_to_square,
+        skip_channel_information=skip_channel_information,
         save_knn_model_path=args.knn_model_path,
     )
     return clf
@@ -856,6 +917,7 @@ def _run_cli_infer(args: argparse.Namespace) -> None:
     if args.inference_batch_size <= 0:
         raise ValueError("--inference-batch-size must be > 0.")
     pad_to_square = bool(getattr(args, "pad_to_square", False))
+    skip_channel_information = cast(str | None, getattr(args, "skip_channel_information", None))
     clf = pipeline(
         "image-classification",
         model_path=args.model,
@@ -863,11 +925,12 @@ def _run_cli_infer(args: argparse.Namespace) -> None:
         device=args.device,
         top_k=args.top_k,
         pad_to_square=pad_to_square,
+        skip_channel_information=skip_channel_information,
     )
     image_input = args.image
     image_batch = [image_input for _ in range(args.inference_batch_size)]
-    single_result = clf(image_input, pad_to_square=pad_to_square)
-    batch_result = clf(image_batch, pad_to_square=pad_to_square)
+    single_result = clf(image_input, pad_to_square=pad_to_square, skip_channel_information=skip_channel_information)
+    batch_result = clf(image_batch, pad_to_square=pad_to_square, skip_channel_information=skip_channel_information)
     logger.info("Single-image inference input: %s", image_input)
     logger.info("Single-image inference result: %s", single_result)
     logger.info("Batch inference URLs (count=%d): %s", args.inference_batch_size, image_batch)
@@ -877,6 +940,7 @@ def _run_cli_infer(args: argparse.Namespace) -> None:
 def _run_cli_predict(args: argparse.Namespace) -> None:
     """Handle the `predict` CLI command."""
     pad_to_square = bool(getattr(args, "pad_to_square", False))
+    skip_channel_information = cast(str | None, getattr(args, "skip_channel_information", None))
     clf = pipeline(
         "image-classification",
         model_path=args.model,
@@ -884,14 +948,16 @@ def _run_cli_predict(args: argparse.Namespace) -> None:
         device=args.device,
         top_k=args.top_k,
         pad_to_square=pad_to_square,
+        skip_channel_information=skip_channel_information,
     )
-    result = clf(args.image, pad_to_square=pad_to_square)
+    result = clf(args.image, pad_to_square=pad_to_square, skip_channel_information=skip_channel_information)
     logger.info("Prediction result: %s", result)
 
 
 def _run_cli_eval(args: argparse.Namespace) -> None:
     """Handle the `eval` CLI command."""
     pad_to_square = bool(getattr(args, "pad_to_square", False))
+    skip_channel_information = cast(str | None, getattr(args, "skip_channel_information", None))
     clf = pipeline(
         "image-classification",
         model_path=args.model,
@@ -899,6 +965,7 @@ def _run_cli_eval(args: argparse.Namespace) -> None:
         device=args.device,
         top_k=args.top_k,
         pad_to_square=pad_to_square,
+        skip_channel_information=skip_channel_information,
     )
     metrics = clf.evaluate(
         dataset=args.dataset,
@@ -916,6 +983,7 @@ def _run_cli_eval(args: argparse.Namespace) -> None:
         negative_classes=tuple(args.negative_classes),
         positive_classes_population_ratio=args.positive_classes_population_ratio,
         pad_to_square=pad_to_square,
+        skip_channel_information=skip_channel_information,
     )
     logger.info("Eval metrics: %s", metrics)
 
@@ -985,6 +1053,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Pad images with black pixels to square shape before preprocessing.",
     )
+    train_parser.add_argument(
+        "--skip-channel-information",
+        choices=["R", "G", "B"],
+        default=None,
+        help="Clone selected channel into all RGB channels before optional square padding.",
+    )
 
     infer_parser = subparsers.add_parser(
         "infer",
@@ -998,6 +1072,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--pad-to-square",
         action="store_true",
         help="Pad images with black pixels to square shape before preprocessing.",
+    )
+    infer_parser.add_argument(
+        "--skip-channel-information",
+        choices=["R", "G", "B"],
+        default=None,
+        help="Clone selected channel into all RGB channels before optional square padding.",
     )
     infer_parser.add_argument(
         "--image",
@@ -1021,6 +1101,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--pad-to-square",
         action="store_true",
         help="Pad images with black pixels to square shape before preprocessing.",
+    )
+    predict_parser.add_argument(
+        "--skip-channel-information",
+        choices=["R", "G", "B"],
+        default=None,
+        help="Clone selected channel into all RGB channels before optional square padding.",
     )
 
     eval_parser = subparsers.add_parser("eval", help="Evaluate trained KNN head on a dataset split.")
@@ -1078,6 +1164,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--pad-to-square",
         action="store_true",
         help="Pad images with black pixels to square shape before preprocessing.",
+    )
+    eval_parser.add_argument(
+        "--skip-channel-information",
+        choices=["R", "G", "B"],
+        default=None,
+        help="Clone selected channel into all RGB channels before optional square padding.",
     )
 
     return parser
