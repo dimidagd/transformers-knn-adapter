@@ -803,6 +803,7 @@ def _validate_cli_train_args(args: argparse.Namespace) -> None:
 def _train_pipeline_from_args(args: argparse.Namespace) -> KNNImageClassificationPipeline:
     """Build and train a pipeline instance from parsed CLI arguments."""
     _validate_cli_train_args(args)
+    pad_to_square = bool(getattr(args, "pad_to_square", False))
 
     clf = pipeline(
         "image-classification",
@@ -810,7 +811,7 @@ def _train_pipeline_from_args(args: argparse.Namespace) -> KNNImageClassificatio
         knn_model_path=args.knn_model_path,
         device=args.device,
         top_k=args.top_k,
-        pad_to_square=args.pad_to_square,
+        pad_to_square=pad_to_square,
     )
 
     logger.info(
@@ -837,7 +838,7 @@ def _train_pipeline_from_args(args: argparse.Namespace) -> KNNImageClassificatio
         grid_search_splits=args.grid_search_splits if args.grid_search_splits is not None else 3,
         grid_search_repeats=args.grid_search_repeats if args.grid_search_repeats is not None else 2,
         grid_search_scoring=args.grid_search_scoring,
-        pad_to_square=args.pad_to_square,
+        pad_to_square=pad_to_square,
         save_knn_model_path=args.knn_model_path,
     )
     return clf
@@ -854,18 +855,19 @@ def _run_cli_infer(args: argparse.Namespace) -> None:
     """Handle the `infer` CLI command using an already-trained KNN model."""
     if args.inference_batch_size <= 0:
         raise ValueError("--inference-batch-size must be > 0.")
+    pad_to_square = bool(getattr(args, "pad_to_square", False))
     clf = pipeline(
         "image-classification",
         model_path=args.model,
         knn_model_path=args.knn_model_path,
         device=args.device,
         top_k=args.top_k,
-        pad_to_square=args.pad_to_square,
+        pad_to_square=pad_to_square,
     )
     image_input = args.image
     image_batch = [image_input for _ in range(args.inference_batch_size)]
-    single_result = clf(image_input, pad_to_square=args.pad_to_square)
-    batch_result = clf(image_batch, pad_to_square=args.pad_to_square)
+    single_result = clf(image_input, pad_to_square=pad_to_square)
+    batch_result = clf(image_batch, pad_to_square=pad_to_square)
     logger.info("Single-image inference input: %s", image_input)
     logger.info("Single-image inference result: %s", single_result)
     logger.info("Batch inference URLs (count=%d): %s", args.inference_batch_size, image_batch)
@@ -874,27 +876,29 @@ def _run_cli_infer(args: argparse.Namespace) -> None:
 
 def _run_cli_predict(args: argparse.Namespace) -> None:
     """Handle the `predict` CLI command."""
+    pad_to_square = bool(getattr(args, "pad_to_square", False))
     clf = pipeline(
         "image-classification",
         model_path=args.model,
         knn_model_path=args.knn_model_path,
         device=args.device,
         top_k=args.top_k,
-        pad_to_square=args.pad_to_square,
+        pad_to_square=pad_to_square,
     )
-    result = clf(args.image, pad_to_square=args.pad_to_square)
+    result = clf(args.image, pad_to_square=pad_to_square)
     logger.info("Prediction result: %s", result)
 
 
 def _run_cli_eval(args: argparse.Namespace) -> None:
     """Handle the `eval` CLI command."""
+    pad_to_square = bool(getattr(args, "pad_to_square", False))
     clf = pipeline(
         "image-classification",
         model_path=args.model,
         knn_model_path=args.knn_model_path,
         device=args.device,
         top_k=args.top_k,
-        pad_to_square=args.pad_to_square,
+        pad_to_square=pad_to_square,
     )
     metrics = clf.evaluate(
         dataset=args.dataset,
@@ -911,7 +915,7 @@ def _run_cli_eval(args: argparse.Namespace) -> None:
         min_class_instances=args.min_class_instances,
         negative_classes=tuple(args.negative_classes),
         positive_classes_population_ratio=args.positive_classes_population_ratio,
-        pad_to_square=args.pad_to_square,
+        pad_to_square=pad_to_square,
     )
     logger.info("Eval metrics: %s", metrics)
 
