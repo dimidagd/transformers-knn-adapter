@@ -24,7 +24,7 @@ from PIL import Image
 from transformers import ViTConfig, ViTForImageClassification, ViTImageProcessor, ViTModel
 
 import transformers_knn_adapter.knn_image_pipeline as knn_image_pipeline_module
-from transformers_knn_adapter.knn_image_pipeline import pipeline
+from transformers_knn_adapter.knn_image_pipeline import KNNImageClassificationPipeline, pipeline
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -468,6 +468,31 @@ def test_train_streaming_iterable_dataset(
     )
     _assert_artifact_and_model(case)
     _assert_knn_classes(case["clf"], set(EXPECTED_CLASSES))
+
+
+def test_pad_image_to_square_returns_square_with_black_padding() -> None:
+    """Square padding should keep content centered and fill margins with black."""
+    image = Image.new("RGB", (10, 4), (255, 0, 0))
+    padded = KNNImageClassificationPipeline._pad_image_to_square(image)
+
+    assert padded.size == (10, 10)
+    # Top-left corner should be padding.
+    assert padded.getpixel((0, 0)) == (0, 0, 0)
+    # Center line should contain original red content.
+    assert padded.getpixel((5, 5)) == (255, 0, 0)
+
+
+def test_clone_channel_to_rgb_keeps_only_selected_channel() -> None:
+    """Channel cloning should replicate selected channel and discard others."""
+    image = Image.new("RGB", (1, 1), (10, 120, 250))
+
+    red_only = KNNImageClassificationPipeline._clone_channel_to_rgb(image, "R")
+    green_only = KNNImageClassificationPipeline._clone_channel_to_rgb(image, "G")
+    blue_only = KNNImageClassificationPipeline._clone_channel_to_rgb(image, "B")
+
+    assert red_only.getpixel((0, 0)) == (10, 10, 10)
+    assert green_only.getpixel((0, 0)) == (120, 120, 120)
+    assert blue_only.getpixel((0, 0)) == (250, 250, 250)
 
 
 def test_train_and_evaluate_with_local_imagefolder_path(
