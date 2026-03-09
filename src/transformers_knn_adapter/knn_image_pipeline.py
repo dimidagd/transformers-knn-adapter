@@ -104,6 +104,136 @@ class KNNImageClassificationPipeline(ImageClassificationPipeline):
             return label_names[int(raw_label)]
         return raw_label
 
+    def _extract_string_labels(
+        self,
+        *,
+        dataset_obj: HFDataset,
+        label_column: str,
+        label_names: list[str] | None,
+    ) -> list[str]:
+        raw_labels = cast(list[Any], dataset_obj[label_column])
+        return [str(self._normalize_label(raw_label, label_names)) for raw_label in raw_labels]
+
+    def _apply_min_class_filter(
+        self,
+        *,
+        dataset_obj: HFDataset,
+        labels: list[str],
+        min_class_instances: int,
+    ) -> tuple[HFDataset, list[str]]:
+        class_counts = Counter(labels)
+        keep_labels = {label for label, count in class_counts.items() if count >= min_class_instances}
+        if not keep_labels:
+            raise ValueError(
+                f"No classes meet min_class_instances={min_class_instances}. "
+                "Lower threshold or disable this filter."
+            )
+        if len(keep_labels) == len(class_counts):
+            return dataset_obj, labels
+
+        keep_indices = [idx for idx, label in enumerate(labels) if label in keep_labels]
+        dropped = len(labels) - len(keep_indices)
+        filtered_dataset = dataset_obj.select(keep_indices)
+        filtered_labels = [labels[idx] for idx in keep_indices]
+        logger.info(
+            "Dropped %d eval samples from classes below min_class_instances=%d",
+            dropped,
+            min_class_instances,
+        )
+        return filtered_dataset, filtered_labels
+
+    def _apply_positive_population_ratio(
+        self,
+        *,
+        dataset_obj: HFDataset,
+        labels: list[str],
+        negative_classes: list[str],
+        positive_classes_population_ratio: float,
+        shuffle_seed: int,
+    ) -> tuple[HFDataset, list[str]]:
+        negative_label_set = {str(label) for label in negative_classes}
+        positive_indices = [idx for idx, label in enumerate(labels) if label not in negative_label_set]
+        negative_indices = [idx for idx, label in enumerate(labels) if label in negative_label_set]
+        positive_count = len(positive_indices)
+        negative_count = len(negative_indices)
+        if positive_count == 0 or negative_count == 0:
+            logger.warning(
+                "Requested positive_classes_population_ratio=%.6f cannot be adjusted because only one group "
+                "(positive or negative) is present.",
+                positive_classes_population_ratio,
+            )
+            return dataset_obj, labels
+
+        rng = np.random.default_rng(shuffle_seed)
+        target_ratio = positive_classes_population_ratio
+        if target_ratio == 1.0:
+            keep_indices = positive_indices
+        elif target_ratio == 0.0:
+            keep_indices = negative_indices
+        else:
+            current_ratio = positive_count / (positive_count + negative_count)
+            if current_ratio > target_ratio:
+                target_positive_count = int(math.floor((target_ratio / (1.0 - target_ratio)) * negative_count))
+                kept_positive = (
+                    set(int(i) for i in rng.choice(positive_indices, size=target_positive_count, replace=False))
+                    if target_positive_count > 0
+                    else set()
+                )
+                keep_indices = [idx for idx in range(len(labels)) if idx in kept_positive or idx in negative_indices]
+            else:
+                target_negative_count = int(math.floor(((1.0 - target_ratio) / target_ratio) * positive_count))
+                kept_negative = (
+                    set(int(i) for i in rng.choice(negative_indices, size=target_negative_count, replace=False))
+                    if target_negative_count > 0
+                    else set()
+                )
+                keep_indices = [idx for idx in range(len(labels)) if idx in positive_indices or idx in kept_negative]
+
+        subsampled_dataset = dataset_obj.select(keep_indices)
+        subsampled_labels = [labels[idx] for idx in keep_indices]
+        positive_after = sum(1 for label in subsampled_labels if label not in negative_label_set)
+        total_after = len(subsampled_labels)
+        if total_after > 0:
+            achieved_ratio = positive_after / total_after
+            if not math.isclose(achieved_ratio, target_ratio, rel_tol=0.0, abs_tol=1e-12):
+                logger.warning(
+                    "Requested positive_classes_population_ratio=%.6f but achieved ratio=%.6f "
+                    "(positive_samples=%d total_samples=%d)",
+                    target_ratio,
+                    achieved_ratio,
+                    positive_after,
+                    total_after,
+                )
+        return subsampled_dataset, subsampled_labels
+
+    def _apply_eval_class_controls(
+        self,
+        *,
+        dataset_obj: HFDataset,
+        label_column: str,
+        label_names: list[str] | None,
+        min_class_instances: int | None,
+        negative_classes: list[str],
+        positive_classes_population_ratio: float | None,
+        shuffle_seed: int,
+    ) -> HFDataset:
+        labels = self._extract_string_labels(dataset_obj=dataset_obj, label_column=label_column, label_names=label_names)
+        if min_class_instances is not None:
+            dataset_obj, labels = self._apply_min_class_filter(
+                dataset_obj=dataset_obj,
+                labels=labels,
+                min_class_instances=min_class_instances,
+            )
+        if positive_classes_population_ratio is not None:
+            dataset_obj, _ = self._apply_positive_population_ratio(
+                dataset_obj=dataset_obj,
+                labels=labels,
+                negative_classes=negative_classes,
+                positive_classes_population_ratio=positive_classes_population_ratio,
+                shuffle_seed=shuffle_seed,
+            )
+        return dataset_obj
+
     def _materialize_training_features_and_labels(
         self,
         *,
@@ -406,6 +536,9 @@ class KNNImageClassificationPipeline(ImageClassificationPipeline):
         shuffle_seed: int = 42,
         shuffle_buffer_size: int = 1000,
         max_samples: int | None = None,
+        min_class_instances: int | None = None,
+        negative_classes: list[str] = ["other"],
+        positive_classes_population_ratio: float | None = None,
     ) -> dict[str, Any]:
         """Evaluate top-1 accuracy on a dataset or dataset split."""
         if self.knn_model is None:
@@ -416,9 +549,17 @@ class KNNImageClassificationPipeline(ImageClassificationPipeline):
             raise ValueError("shuffle_buffer_size must be > 0")
         if max_samples is not None and max_samples <= 0:
             raise ValueError("max_samples must be > 0")
+        if min_class_instances is not None and min_class_instances <= 0:
+            raise ValueError("min_class_instances must be > 0")
+        if positive_classes_population_ratio is not None and not (0.0 <= positive_classes_population_ratio <= 1.0):
+            raise ValueError("positive_classes_population_ratio must be in [0.0, 1.0]")
         if streaming and stratified:
             raise ValueError("stratified mode is only supported when streaming=False.")
-
+        if streaming and (min_class_instances is not None or positive_classes_population_ratio is not None):
+            raise ValueError(
+                "min_class_instances and positive_classes_population_ratio require streaming=False "
+                "(class-aware filtering/subsampling needs materialized datasets)."
+            )
         dataset_obj = self._resolve_dataset(dataset=dataset, split=split, streaming=streaming)
         if stratified:
             if not isinstance(dataset_obj, HFDataset):
@@ -440,6 +581,19 @@ class KNNImageClassificationPipeline(ImageClassificationPipeline):
         if hasattr(dataset_obj, "features") and label_column in dataset_obj.features:
             label_feature = dataset_obj.features[label_column]
             label_names = getattr(label_feature, "names", None)
+
+        if not isinstance(dataset_obj, IterableDataset) and (
+            min_class_instances is not None or positive_classes_population_ratio is not None
+        ):
+            dataset_obj = self._apply_eval_class_controls(
+                dataset_obj=dataset_obj,
+                label_column=label_column,
+                label_names=label_names,
+                min_class_instances=min_class_instances,
+                negative_classes=negative_classes,
+                positive_classes_population_ratio=positive_classes_population_ratio,
+                shuffle_seed=shuffle_seed,
+            )
 
         if isinstance(dataset_obj, IterableDataset):
             dataset_for_eval = dataset_obj.take(max_samples) if max_samples is not None else dataset_obj
@@ -701,6 +855,9 @@ def _run_cli_eval(args: argparse.Namespace) -> None:
         shuffle_seed=args.shuffle_seed,
         shuffle_buffer_size=args.shuffle_buffer_size,
         max_samples=args.max_samples,
+        min_class_instances=args.min_class_instances,
+        negative_classes=args.negative_classes,
+        positive_classes_population_ratio=args.positive_classes_population_ratio,
     )
     logger.info("Eval metrics: %s", metrics)
 
@@ -821,6 +978,27 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Streaming shuffle buffer size (used with --stream --shuffle).",
     )
     eval_parser.add_argument("--max-samples", type=int, default=None, help="Optional cap on evaluation samples.")
+    eval_parser.add_argument(
+        "--min-class-instances",
+        type=int,
+        default=None,
+        help="Drop classes with fewer than this number of eval instances (non-streaming only).",
+    )
+    eval_parser.add_argument(
+        "--negative-classes",
+        default=["other"],
+        type=lambda value: [item.strip() for item in value.split(",") if item.strip()],
+        help="Comma-separated class labels treated as negative classes (default: other).",
+    )
+    eval_parser.add_argument(
+        "--positive-classes-population-ratio",
+        type=float,
+        default=None,
+        help=(
+            "Target ratio of positive samples to total samples after subsampling "
+            "(non-streaming only). Positive classes are inferred as labels not in --negative-classes."
+        ),
+    )
     eval_parser.add_argument("--top-k", type=int, default=1, help="Top-k predictions (evaluation uses top-1).")
     eval_parser.add_argument("--device", type=int, default=-1, help="Transformers device index (-1 for CPU).")
 
