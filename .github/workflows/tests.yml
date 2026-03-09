@@ -117,10 +117,6 @@ jobs:
 
   build:
     runs-on: ubuntu-latest
-    needs:
-      - lint
-      - typecheck
-      - pytest
     env:
       UV_CACHE_DIR: .uv-cache
     strategy:
