@@ -30,7 +30,8 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 logger = logging.getLogger(__name__)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
-EXPECTED_CLASSES = ("class_a", "class_b")
+EXPECTED_CLASSES = ("class_a", "class_b", "class_c")
+SAMPLING_EXPECTED_CLASSES = {"class_a", "class_b", "class_c"}
 TRAIN_DEFAULTS = {
     "image_column": "image",
     "label_column": "label",
@@ -38,7 +39,8 @@ TRAIN_DEFAULTS = {
     "n_neighbors": 1,
 }
 ORDERED_CLASS_A_COUNT = 60
-ORDERED_CLASS_B_COUNT = 60
+ORDERED_CLASS_B_COUNT = 40
+ORDERED_CLASS_C_COUNT = 20
 SUBSET_MAX_SAMPLES = 20
 TEST_SHUFFLE_SEED = 1234
 GRID_SEARCH_K_VALUES = {1, 2, 4, 8, 16, 32}
@@ -131,7 +133,8 @@ def get_hf_dataset(rng: np.random.Generator, num_samples: int = 100) -> tuple[Da
         rows.append(
             {
                 "image": Image.fromarray(rng.integers(0, 255, size=(32, 32, 3), dtype=np.uint8), mode="RGB"),
-                "label": int(rng.integers(0, len(EXPECTED_CLASSES))),
+                # Cycle labels to guarantee all classes are represented deterministically.
+                "label": i % len(EXPECTED_CLASSES),
             }
         )
 
@@ -254,12 +257,28 @@ def _assert_knn_classes(clf, expected: set[str]) -> None:
 
 
 def _build_sampling_bias_dataset(rng: np.random.Generator) -> Dataset:
-    """Build a deterministic ordered dataset used for sampling/shuffle/stratified tests."""
-    return _build_ordered_dataset(
-        rng=rng,
-        first_label_count=ORDERED_CLASS_A_COUNT,
-        second_label_count=ORDERED_CLASS_B_COUNT,
+    """Build deterministic ordered 3-class dataset for sampling/shuffle/stratified tests."""
+    label_to_id = {label: i for i, label in enumerate(EXPECTED_CLASSES)}
+    rows: list[dict[str, Any]] = []
+    for class_name, class_count in (
+        ("class_a", ORDERED_CLASS_A_COUNT),
+        ("class_b", ORDERED_CLASS_B_COUNT),
+        ("class_c", ORDERED_CLASS_C_COUNT),
+    ):
+        for _ in range(class_count):
+            rows.append(
+                {
+                    "image": Image.fromarray(rng.integers(0, 255, size=(32, 32, 3), dtype=np.uint8), mode="RGB"),
+                    "label": label_to_id[class_name],
+                }
+            )
+    features = Features(
+        {
+            "image": HFImage(),
+            "label": ClassLabel(names=list(EXPECTED_CLASSES)),
+        }
     )
+    return Dataset.from_list(rows, features=features)
 
 
 def _evaluate_true_label_set(
@@ -293,7 +312,7 @@ def _build_subset_sampling_train_kwargs(*, stratified: bool, shuffle: bool) -> d
     if stratified:
         kwargs["streaming"] = False
     if shuffle:
-        kwargs["shuffle_buffer_size"] = ORDERED_CLASS_A_COUNT + ORDERED_CLASS_B_COUNT
+        kwargs["shuffle_buffer_size"] = ORDERED_CLASS_A_COUNT + ORDERED_CLASS_B_COUNT + ORDERED_CLASS_C_COUNT
     return kwargs
 
 
@@ -306,7 +325,7 @@ def _build_subset_sampling_eval_kwargs(*, stratified: bool, shuffle: bool) -> di
     if stratified or shuffle:
         kwargs["shuffle_seed"] = TEST_SHUFFLE_SEED
     if shuffle:
-        kwargs["shuffle_buffer_size"] = ORDERED_CLASS_A_COUNT + ORDERED_CLASS_B_COUNT
+        kwargs["shuffle_buffer_size"] = ORDERED_CLASS_A_COUNT + ORDERED_CLASS_B_COUNT + ORDERED_CLASS_C_COUNT
     return kwargs
 
 
@@ -507,9 +526,9 @@ def test_train_with_grid_search_selects_knn_hyperparameters(
     ("stratified", "shuffle", "expected_classes"),
     [
         pytest.param(False, False, {"class_a"}, id="unstratified-unshuffled"),
-        pytest.param(False, True, set(EXPECTED_CLASSES), id="unstratified-shuffled"),
-        pytest.param(True, False, set(EXPECTED_CLASSES), id="stratified-unshuffled"),
-        pytest.param(True, True, set(EXPECTED_CLASSES), id="stratified-shuffled"),
+        pytest.param(False, True, SAMPLING_EXPECTED_CLASSES, id="unstratified-shuffled"),
+        pytest.param(True, False, SAMPLING_EXPECTED_CLASSES, id="stratified-unshuffled"),
+        pytest.param(True, True, SAMPLING_EXPECTED_CLASSES, id="stratified-shuffled"),
     ],
 )
 def test_train_sampling_modes_with_max_samples(
@@ -539,9 +558,9 @@ def test_train_sampling_modes_with_max_samples(
     ("stratified", "shuffle", "expected_true_labels"),
     [
         pytest.param(False, False, {"class_a"}, id="unstratified-unshuffled"),
-        pytest.param(False, True, set(EXPECTED_CLASSES), id="unstratified-shuffled"),
-        pytest.param(True, False, set(EXPECTED_CLASSES), id="stratified-unshuffled"),
-        pytest.param(True, True, set(EXPECTED_CLASSES), id="stratified-shuffled"),
+        pytest.param(False, True, SAMPLING_EXPECTED_CLASSES, id="unstratified-shuffled"),
+        pytest.param(True, False, SAMPLING_EXPECTED_CLASSES, id="stratified-unshuffled"),
+        pytest.param(True, True, SAMPLING_EXPECTED_CLASSES, id="stratified-shuffled"),
     ],
 )
 def test_evaluate_sampling_modes_with_max_samples(
