@@ -571,6 +571,97 @@ def test_evaluate_sampling_modes_with_max_samples(
     assert true_labels == expected_true_labels
 
 
+def test_evaluate_drops_classes_below_min_instances(
+    pipeline_factory,
+    rng: np.random.Generator,
+    model_class: type[ViTModel] | type[ViTForImageClassification],
+) -> None:
+    """Eval should remove classes with fewer than configured minimum instances."""
+    dataset = _build_ordered_dataset(
+        rng=rng,
+        first_label_count=20,
+        second_label_count=2,
+    )
+    train_case = _run_training_case(
+        pipeline_factory=pipeline_factory,
+        dataset=dataset,
+        model_class=model_class,
+    )
+    clf = train_case["clf"]
+    metrics = clf.evaluate(
+        dataset=dataset,
+        split="train",
+        image_column="image",
+        label_column="label",
+        min_class_instances=3,
+    )
+    assert metrics["samples"] == 20
+    assert metrics["true_label_counts"] == {"class_a": 20}
+
+
+def test_evaluate_positive_ratio_warns_when_unachievable(
+    pipeline_factory,
+    rng: np.random.Generator,
+    caplog: pytest.LogCaptureFixture,
+    model_class: type[ViTModel] | type[ViTForImageClassification],
+) -> None:
+    """Eval should warn when requested positive ratio cannot be met exactly."""
+    dataset = _build_ordered_dataset(
+        rng=rng,
+        first_label_count=10,
+        second_label_count=3,
+    )
+    train_case = _run_training_case(
+        pipeline_factory=pipeline_factory,
+        dataset=dataset,
+        model_class=model_class,
+    )
+    clf = train_case["clf"]
+    caplog.set_level(logging.WARNING)
+    metrics = clf.evaluate(
+        dataset=dataset,
+        split="train",
+        image_column="image",
+        label_column="label",
+        negative_classes=["class_b"],
+        positive_classes_population_ratio=0.45,
+    )
+    assert metrics["samples"] == 5
+    assert metrics["true_label_counts"] == {"class_a": 2, "class_b": 3}
+    assert "Requested positive_classes_population_ratio=0.450000 but achieved ratio=0.400000" in caplog.text
+
+
+def test_evaluate_positive_ratio_achieves_requested_ratio(
+    pipeline_factory,
+    rng: np.random.Generator,
+    model_class: type[ViTModel] | type[ViTForImageClassification],
+) -> None:
+    """Eval should hit the requested positive-class ratio when integer-feasible."""
+    dataset = _build_ordered_dataset(
+        rng=rng,
+        first_label_count=9,
+        second_label_count=3,
+    )
+    train_case = _run_training_case(
+        pipeline_factory=pipeline_factory,
+        dataset=dataset,
+        model_class=model_class,
+    )
+    clf = train_case["clf"]
+    metrics = clf.evaluate(
+        dataset=dataset,
+        split="train",
+        image_column="image",
+        label_column="label",
+        negative_classes=["class_b"],
+        positive_classes_population_ratio=0.75,
+    )
+    assert metrics["samples"] == 12
+    assert metrics["true_label_counts"] == {"class_a": 9, "class_b": 3}
+    achieved_ratio = metrics["true_label_counts"]["class_a"] / metrics["samples"]
+    assert achieved_ratio == 0.75
+
+
 def test_cli_infer_mode_with_local_fake_image(
     pipeline_factory,
     rng: np.random.Generator,
