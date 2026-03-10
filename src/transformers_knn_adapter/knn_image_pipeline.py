@@ -30,6 +30,7 @@ from sklearn.model_selection import GridSearchCV, RepeatedStratifiedKFold
 from sklearn.neighbors import KNeighborsClassifier
 from tqdm.auto import tqdm
 from transformers import AutoImageProcessor, AutoModel
+from transformers import pipeline as hf_pipeline
 from transformers.image_utils import load_image
 from transformers.pipelines import ImageClassificationPipeline
 
@@ -53,6 +54,18 @@ class KNNImageClassificationPipeline(ImageClassificationPipeline):
         self.knn_model_path = str(knn_model_path)
         self.pad_to_square = pad_to_square
         self.skip_channel_information = skip_channel_information
+        feature_device = -1
+        if isinstance(self.device, torch.device) and self.device.type == "cuda":
+            feature_device = 0 if self.device.index is None else int(self.device.index)
+        elif isinstance(self.device, int):
+            feature_device = self.device
+        self.feature_extraction_pipeline: Any = hf_pipeline(
+            "image-feature-extraction",
+            model=self.model,
+            image_processor=self.image_processor,
+            framework="pt",
+            device=feature_device,
+        )
         self.knn_model: ClassifierMixin | None = None
         if Path(self.knn_model_path).exists():
             logger.info("Loading KNN model from %s", self.knn_model_path)
@@ -151,7 +164,7 @@ class KNNImageClassificationPipeline(ImageClassificationPipeline):
             pad_to_square=pad_to_square,
             skip_channel_information=skip_channel_information,
         )
-        return super().preprocess(prepared_image, **preprocess_params)
+        return {"prepared_image": prepared_image}
 
     def _resolve_dataset(self, dataset: Any, split: str, streaming: bool = False) -> HFDataset | IterableDataset:
         if isinstance(dataset, (str, os.PathLike)):
@@ -310,10 +323,74 @@ class KNNImageClassificationPipeline(ImageClassificationPipeline):
             )
         return dataset_obj
 
+    def _iter_dataset_batches(
+        self,
+        *,
+        dataset_obj: HFDataset | IterableDataset,
+        image_column: str,
+        label_column: str,
+        batch_size: int,
+        max_samples: int | None,
+    ) -> tuple[Any, int | None, int | None]:
+        if isinstance(dataset_obj, IterableDataset):
+            dataset_for_batches = dataset_obj.take(max_samples) if max_samples is not None else dataset_obj
+            batched_iter: Any = dataset_for_batches.batch(batch_size=batch_size)
+            total_samples = max_samples
+            total_batches = math.ceil(total_samples / batch_size) if total_samples is not None else None
+            return batched_iter, total_samples, total_batches
+
+        if max_samples is not None:
+            dataset_obj = dataset_obj.select(range(min(max_samples, len(dataset_obj))))
+        total_samples = len(dataset_obj)
+        total_batches = math.ceil(total_samples / batch_size)
+        batched_iter = (
+            {
+                image_column: batch[image_column],
+                label_column: batch[label_column],
+            }
+            for start in range(0, total_samples, batch_size)
+            for batch in [dataset_obj[start : min(start + batch_size, total_samples)]]
+        )
+        return batched_iter, total_samples, total_batches
+
+    def _prepare_batch_images(
+        self,
+        image_values: list[Any],
+        *,
+        pad_to_square: bool,
+        skip_channel_information: str | None,
+    ) -> list[Image.Image]:
+        return [
+            self._prepare_image(
+                image_value,
+                pad_to_square=pad_to_square,
+                skip_channel_information=skip_channel_information,
+            )
+            for image_value in image_values
+        ]
+
+    def _extract_embeddings_from_images(self, images: list[Image.Image]) -> np.ndarray:
+        raw_features = self.feature_extraction_pipeline(images, batch_size=len(images))
+        features_np = np.asarray(raw_features, dtype=np.float32)
+        # Some HF backends return an extra singleton axis: (B, 1, T, D).
+        if features_np.ndim == 4 and features_np.shape[1] == 1:
+            features_np = features_np[:, 0, :, :]
+        if features_np.ndim == 3:
+            # Keep CLS-token embedding for consistency with existing behavior.
+            return features_np[:, 0, :]
+        if features_np.ndim == 2:
+            if len(images) == 1:
+                return features_np[0:1, :]
+            return features_np
+        raise ValueError(
+            "Expected 2D/3D features (or 4D with singleton axis) from extraction pipeline, "
+            f"got shape {features_np.shape}"
+        )
+
     def _materialize_training_features_and_labels(
         self,
         *,
-        dataset_obj: IterableDataset,
+        dataset_obj: HFDataset | IterableDataset,
         image_column: str,
         label_column: str,
         batch_size: int,
@@ -330,10 +407,13 @@ class KNNImageClassificationPipeline(ImageClassificationPipeline):
         write_idx = 0
         labels: list[Any] = []
         loaded = 0
-        dataset_for_batches = dataset_obj.take(max_samples) if max_samples is not None else dataset_obj
-        batched_iter = dataset_for_batches.batch(batch_size=batch_size)
-        total_samples = max_samples if max_samples is not None else (len(dataset_obj) if hasattr(dataset_obj, "__len__") else None)
-        total_batches = math.ceil(total_samples / batch_size) if total_samples is not None else None
+        batched_iter, total_samples, total_batches = self._iter_dataset_batches(
+            dataset_obj=dataset_obj,
+            image_column=image_column,
+            label_column=label_column,
+            batch_size=batch_size,
+            max_samples=max_samples,
+        )
 
         for batch in tqdm(
             batched_iter,
@@ -342,28 +422,14 @@ class KNNImageClassificationPipeline(ImageClassificationPipeline):
         ):
             image_values = batch[image_column]
             label_values = batch[label_column]
-            batch_images = [
-                self._prepare_image(
-                    image_value,
-                    pad_to_square=pad_to_square,
-                    skip_channel_information=skip_channel_information,
-                )
-                for image_value in image_values
-            ]
+            batch_images = self._prepare_batch_images(
+                image_values,
+                pad_to_square=pad_to_square,
+                skip_channel_information=skip_channel_information,
+            )
             labels.extend(self._normalize_label(raw_label, label_names) for raw_label in label_values)
             loaded += len(label_values)
-            if self.image_processor is None:
-                raise ValueError("image_processor is not configured.")
-            model_inputs = self.image_processor(images=batch_images, return_tensors="pt")
-            model_inputs_on_device: dict[str, Any] = {
-                k: v.to(self.device) if hasattr(v, "to") else v for k, v in model_inputs.items()
-            }
-
-            if self.model is None:
-                raise ValueError("model is not configured.")
-            with torch.inference_mode():
-                model_outputs = self.model(**model_inputs_on_device)
-            embeddings = self._extract_embeddings(model_outputs).detach().cpu().numpy()
+            embeddings = self._extract_embeddings_from_images(batch_images)
             if total_samples is not None:
                 if embeddings_mm is None:
                     with tempfile.NamedTemporaryFile(prefix="knn_emb_", suffix=".mmap", delete=False) as f:
@@ -554,9 +620,6 @@ class KNNImageClassificationPipeline(ImageClassificationPipeline):
                     seed=shuffle_seed,
                 )["train"]
             logger.info("Applied stratified sampling for training subset")
-
-        if not isinstance(dataset_obj, IterableDataset):
-            dataset_obj = dataset_obj.to_iterable_dataset()
             
         if shuffle:
             if isinstance(dataset_obj, IterableDataset):
@@ -690,29 +753,23 @@ class KNNImageClassificationPipeline(ImageClassificationPipeline):
                 shuffle_seed=shuffle_seed,
             )
 
-        if isinstance(dataset_obj, IterableDataset):
-            dataset_for_eval = dataset_obj.take(max_samples) if max_samples is not None else dataset_obj
-            total_samples = max_samples
-        else:
-            if max_samples is not None:
-                dataset_obj = dataset_obj.select(range(min(max_samples, len(dataset_obj))))
-            total_samples = len(dataset_obj)
-            dataset_for_eval = dataset_obj.to_iterable_dataset()
+        batched_iter, _, total_batches = self._iter_dataset_batches(
+            dataset_obj=dataset_obj,
+            image_column=image_column,
+            label_column=label_column,
+            batch_size=batch_size,
+            max_samples=max_samples,
+        )
 
-        batched_iter = dataset_for_eval.batch(batch_size=batch_size)
-        total_batches = math.ceil(total_samples / batch_size) if total_samples is not None else None
         rows: list[tuple[str, str, bool]] = []
         for batch in tqdm(batched_iter, total=total_batches, desc="Evaluating"):
             image_values = batch[image_column]
             label_values = batch[label_column]
-            batch_images = [
-                self._prepare_image(
-                    image_value,
-                    pad_to_square=resolved_pad_to_square,
-                    skip_channel_information=resolved_skip_channel_information,
-                )
-                for image_value in image_values
-            ]
+            batch_images = self._prepare_batch_images(
+                image_values,
+                pad_to_square=resolved_pad_to_square,
+                skip_channel_information=resolved_skip_channel_information,
+            )
             batch_pred = self(
                 batch_images,
                 pad_to_square=resolved_pad_to_square,
@@ -736,7 +793,9 @@ class KNNImageClassificationPipeline(ImageClassificationPipeline):
         accuracy = correct / total
         y_true = [r[0] for r in rows]
         y_pred = [r[1] for r in rows]
-        report_text = classification_report(y_true, y_pred, zero_division=0)
+        # Restrict report classes to labels present in the evaluation ground truth.
+        eval_labels = list(dict.fromkeys(y_true))
+        report_text = classification_report(y_true, y_pred, labels=eval_labels, zero_division=0)
         true_counts = dict(Counter(r[0] for r in rows))
         pred_counts = dict(Counter(r[1] for r in rows))
 
@@ -755,10 +814,10 @@ class KNNImageClassificationPipeline(ImageClassificationPipeline):
 
     def _extract_embeddings(self, model_outputs: Any) -> torch.Tensor:
         """Extract a 2D embedding tensor from transformer model outputs."""
-        if getattr(model_outputs, "pooler_output", None) is not None:
-            embeddings = cast(torch.Tensor, model_outputs.pooler_output)
-        elif getattr(model_outputs, "last_hidden_state", None) is not None:
+        if getattr(model_outputs, "last_hidden_state", None) is not None:
             embeddings = cast(torch.Tensor, model_outputs.last_hidden_state[:, 0, :])
+        elif getattr(model_outputs, "pooler_output", None) is not None:
+            embeddings = cast(torch.Tensor, model_outputs.pooler_output)
         else:
             raise ValueError("Model outputs do not contain pooler_output or last_hidden_state.")
         embeddings = embeddings.flatten(start_dim=1)
@@ -767,13 +826,16 @@ class KNNImageClassificationPipeline(ImageClassificationPipeline):
         return embeddings
 
     def _forward(self, model_inputs: dict[str, Any], **forward_params: Any) -> Any:
+        del forward_params
         if self.knn_model is None:
             raise ValueError("KNN head is not loaded. Provide knn_model_path or call train(...) first.")
-        logger.debug("Running forward pass with KNN head")
-        model_outputs = self.model(**model_inputs, **forward_params)
-        embeddings = self._extract_embeddings(model_outputs)
-
-        probs_np = self.knn_model.predict_proba(embeddings.detach().cpu().numpy())
+        prepared_images = model_inputs["prepared_image"]
+        if isinstance(prepared_images, list):
+            images = cast(list[Image.Image], prepared_images)
+        else:
+            images = [cast(Image.Image, prepared_images)]
+        embeddings_np = self._extract_embeddings_from_images(images)
+        probs_np = self.knn_model.predict_proba(embeddings_np)
         probs = torch.from_numpy(np.asarray(probs_np, dtype=np.float32))
         return {"probs": probs}
 
