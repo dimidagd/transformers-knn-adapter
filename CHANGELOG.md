@@ -4,6 +4,20 @@ All notable changes to this project will be documented in this file.
 
 This changelog is automatically managed by release-please from commits merged into `main`.
 
+## [0.5.0](https://github.com/dimidagd/transformers-knn-adapter/compare/v0.4.0...v0.5.0) (2026-03-12)
+
+
+### Features
+
+* **knn:** add robust embedding extraction and eval controls ([abc233c](https://github.com/dimidagd/transformers-knn-adapter/commit/abc233cbca5fec9082c6c82e091bdad8ed574761))
+* **pipeline:** unify embeddings via HF image feature pipeline ([7e7747e](https://github.com/dimidagd/transformers-knn-adapter/commit/7e7747e513fea8f0ef1f5c04fca2bb6d0605bc5e))
+* **pipeline:** unify embeddings via HF image pipeline ([02b558a](https://github.com/dimidagd/transformers-knn-adapter/commit/02b558ae58df7e7ed83edacdf30b7fadef5aca36))
+
+
+### Documentation
+
+* **docs:** add repo skills for CLI workflows ([b42a956](https://github.com/dimidagd/transformers-knn-adapter/commit/b42a95627f57e80a9d9f9b1fdcecdbd0ea70e9b9))
+
 ## [0.4.0](https://github.com/dimidagd/transformers-knn-adapter/compare/v0.3.0...v0.4.0) (2026-03-09)
 
 
