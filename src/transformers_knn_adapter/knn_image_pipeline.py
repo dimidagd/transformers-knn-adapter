@@ -13,6 +13,7 @@ import io
 import logging
 import math
 import os
+import re
 import tempfile
 from collections import Counter
 from pathlib import Path
@@ -193,7 +194,60 @@ class KNNImageClassificationPipeline(ImageClassificationPipeline):
         )
         return {"prepared_image": prepared_image}
 
-    def _resolve_dataset(self, dataset: Any, split: str, streaming: bool = False) -> HFDataset | IterableDataset:
+    def _resolve_dataset(
+        self,
+        dataset: Any,
+        split: str,
+        streaming: bool = False,
+        *,
+        pre_shuffle: bool = False,
+        shuffle_seed: int = 42,
+    ) -> HFDataset | IterableDataset:
+        if streaming:
+            return self._resolve_dataset_no_preshuffle(dataset=dataset, split=split, streaming=True)
+        return self._resolve_dataset_with_optional_preshuffle(
+            dataset=dataset,
+            split=split,
+            streaming=False,
+            pre_shuffle=pre_shuffle,
+            shuffle_seed=shuffle_seed,
+        )
+
+    @staticmethod
+    def _parse_split_slice(split: str) -> tuple[str, str] | None:
+        match = re.match(r"^\s*([^\[\]]+)\[([^\[\]]*)\]\s*$", split)
+        if match is None:
+            return None
+        return match.group(1).strip(), match.group(2).strip()
+
+    @staticmethod
+    def _slice_bound_to_index(bound: str, *, size: int, is_start: bool) -> int:
+        if bound == "":
+            return 0 if is_start else size
+        if bound.endswith("%"):
+            percent = float(bound[:-1])
+            if not 0.0 <= percent <= 100.0:
+                raise ValueError(f"Split percent bound out of range: {bound}")
+            return int(math.floor((percent / 100.0) * size))
+        return int(bound)
+
+    def _apply_slice_spec(self, dataset_obj: HFDataset, *, split_spec: str) -> HFDataset:
+        if ":" not in split_spec:
+            raise ValueError(
+                "pre_shuffle currently supports slice expressions with ':' "
+                "(example: train[:80%], train[80%:], train[10%:90%])."
+            )
+        start_raw, end_raw = split_spec.split(":", 1)
+        total = len(dataset_obj)
+        start = self._slice_bound_to_index(start_raw.strip(), size=total, is_start=True)
+        end = self._slice_bound_to_index(end_raw.strip(), size=total, is_start=False)
+        start = max(0, min(start, total))
+        end = max(0, min(end, total))
+        if start > end:
+            raise ValueError(f"Invalid split slice after pre_shuffle: start ({start}) > end ({end}).")
+        return dataset_obj.select(range(start, end))
+
+    def _resolve_dataset_no_preshuffle(self, dataset: Any, split: str, streaming: bool) -> HFDataset | IterableDataset:
         if isinstance(dataset, (str, os.PathLike)):
             dataset_ref = os.fspath(dataset)
             try:
@@ -213,6 +267,50 @@ class KNNImageClassificationPipeline(ImageClassificationPipeline):
         if not isinstance(dataset_obj, (HFDataset, IterableDataset)):
             raise TypeError("Only Hugging Face Dataset/IterableDataset is supported.")
         return dataset_obj
+
+    def _resolve_dataset_with_optional_preshuffle(
+        self,
+        dataset: Any,
+        split: str,
+        streaming: bool,
+        *,
+        pre_shuffle: bool = False,
+        shuffle_seed: int = 42,
+    ) -> HFDataset | IterableDataset:
+        if not pre_shuffle:
+            return self._resolve_dataset_no_preshuffle(dataset=dataset, split=split, streaming=streaming)
+
+        parsed = self._parse_split_slice(split)
+        if parsed is None:
+            return self._resolve_dataset_no_preshuffle(dataset=dataset, split=split, streaming=streaming)
+        base_split, split_spec = parsed
+
+        if isinstance(dataset, (str, os.PathLike)):
+            dataset_ref = os.fspath(dataset)
+            try:
+                from datasets import load_dataset
+            except Exception as exc:  # pragma: no cover - dependency/runtime detail
+                raise ImportError("`datasets` package is required when dataset is a string name.") from exc
+            dataset_path = Path(dataset_ref).expanduser()
+            if dataset_path.is_dir():
+                dataset_obj = load_dataset("imagefolder", data_dir=str(dataset_path), split=base_split, streaming=False)
+            else:
+                dataset_obj = load_dataset(dataset_ref, split=base_split, streaming=False)
+        else:
+            if hasattr(dataset, "keys") and base_split in dataset:
+                dataset_obj = dataset[base_split]
+            else:
+                raise ValueError(
+                    f"pre_shuffle with split slice requires base split '{base_split}' to exist in the provided dataset."
+                )
+
+        if not isinstance(dataset_obj, HFDataset):
+            raise TypeError("pre_shuffle with split slicing requires a non-streaming Hugging Face Dataset.")
+
+        shuffled = dataset_obj.shuffle(seed=shuffle_seed)
+        sliced = self._apply_slice_spec(shuffled, split_spec=split_spec)
+        logger.info("Applied deterministic pre-slice shuffle: split=%s seed=%d", split, shuffle_seed)
+        return sliced
 
     @staticmethod
     def _normalize_label(raw_label: Any, label_names: list[str] | None) -> Any:
@@ -360,6 +458,22 @@ class KNNImageClassificationPipeline(ImageClassificationPipeline):
             return features_np
         raise ValueError(f"Unexpected feature output shape: {features_np.shape}")
 
+    @staticmethod
+    def _save_debug_transformed_samples(
+        *,
+        images: list[Any],
+        output_dir: str | Path,
+        prefix: str,
+    ) -> int:
+        output_path = Path(output_dir)
+        output_path.mkdir(parents=True, exist_ok=True)
+        saved = 0
+        for idx, image_value in enumerate(images):
+            image = KNNImageClassificationPipeline._coerce_image(image_value)
+            image.save(output_path / f"{prefix}_{idx:03d}.png")
+            saved += 1
+        return saved
+
     def _map_dataset_images_for_training(
         self,
         *,
@@ -410,6 +524,8 @@ class KNNImageClassificationPipeline(ImageClassificationPipeline):
         label_names: list[str] | None,
         pad_to_square: bool,
         skip_channel_information: str | None,
+        debug_save_transformed_samples_dir: str | Path | None = None,
+        debug_save_transformed_samples_count: int = 0,
     ) -> tuple[np.ndarray, np.ndarray, np.memmap | None, str | None, int]:
         """Extract embeddings and labels, optionally using memmap storage for known sample counts."""
         self.model.eval()
@@ -433,6 +549,15 @@ class KNNImageClassificationPipeline(ImageClassificationPipeline):
                 skip_channel_information=skip_channel_information,
                 num_workers=num_workers,
             )
+            if debug_save_transformed_samples_dir is not None and debug_save_transformed_samples_count > 0:
+                sample_count = min(debug_save_transformed_samples_count, len(transformed_dataset))
+                sample_images = cast(list[Any], transformed_dataset[image_column][:sample_count])
+                saved = self._save_debug_transformed_samples(
+                    images=sample_images,
+                    output_dir=debug_save_transformed_samples_dir,
+                    prefix="train",
+                )
+                logger.info("Saved %d transformed train debug samples to %s", saved, debug_save_transformed_samples_dir)
             raw_images: Any = KeyDataset(transformed_dataset, image_column)
             feature_iter = self.feature_extraction_pipeline(
                 raw_images,
@@ -443,15 +568,29 @@ class KNNImageClassificationPipeline(ImageClassificationPipeline):
             labels = []
             dataset_for_iter = dataset_obj.take(max_samples) if max_samples is not None else dataset_obj
             total_samples = max_samples
+            debug_saved = 0
 
             def image_iter() -> Any:
+                nonlocal debug_saved
                 for row in dataset_for_iter:
                     labels.append(self._normalize_label(row[label_column], label_names))
-                    yield self._prepare_image(
+                    image = self._prepare_image(
                         row[image_column],
                         pad_to_square=pad_to_square,
                         skip_channel_information=skip_channel_information,
                     )
+                    if (
+                        debug_save_transformed_samples_dir is not None
+                        and debug_save_transformed_samples_count > 0
+                        and debug_saved < debug_save_transformed_samples_count
+                    ):
+                        self._save_debug_transformed_samples(
+                            images=[image],
+                            output_dir=debug_save_transformed_samples_dir,
+                            prefix=f"train_{debug_saved:03d}",
+                        )
+                        debug_saved += 1
+                    yield image
 
             feature_iter = self.feature_extraction_pipeline(
                 image_iter(),
@@ -570,6 +709,34 @@ class KNNImageClassificationPipeline(ImageClassificationPipeline):
         knn.fit(features, y)
         return knn
 
+    @staticmethod
+    def _compute_reid_metrics_from_rank_positions(
+        rank_positions: list[int],
+        *,
+        cmc_ranks: tuple[int, ...],
+    ) -> dict[str, Any]:
+        if not rank_positions:
+            raise ValueError("rank_positions must not be empty for re-identification metrics.")
+        if not cmc_ranks:
+            raise ValueError("cmc_ranks must not be empty for re-identification metrics.")
+        if any(rank <= 0 for rank in cmc_ranks):
+            raise ValueError("All cmc_ranks must be positive integers.")
+        cmc_ranks_sorted = tuple(sorted(set(int(rank) for rank in cmc_ranks)))
+        total = len(rank_positions)
+        # For closed-set class ranking there is exactly one relevant identity/class per query.
+        # AP for each query is therefore reciprocal rank.
+        map_score = float(np.mean([1.0 / float(rank) for rank in rank_positions]))
+        cmc = {
+            f"cmc@{rank}": float(sum(1 for pos in rank_positions if pos <= rank) / total)
+            for rank in cmc_ranks_sorted
+        }
+        return {
+            "queries": total,
+            "mAP": map_score,
+            "cmc": cmc,
+            "mean_rank": float(np.mean(rank_positions)),
+        }
+
     def train(
         self,
         dataset: Any,
@@ -581,6 +748,7 @@ class KNNImageClassificationPipeline(ImageClassificationPipeline):
         num_workers: int = 1,
         streaming: bool = False,
         stratified: bool = False,
+        pre_shuffle: bool = False,
         shuffle: bool = False,
         shuffle_seed: int = 42,
         shuffle_buffer_size: int = 1000,
@@ -594,6 +762,8 @@ class KNNImageClassificationPipeline(ImageClassificationPipeline):
         grid_search_scoring: str | None = None,
         pad_to_square: bool | None = None,
         skip_channel_information: str | None = None,
+        debug_save_transformed_samples_dir: str | Path | None = None,
+        debug_save_transformed_samples_count: int = 0,
         save_knn_model_path: str | Path | None = None,
     ) -> ClassifierMixin:
         """Train and attach a KNN head from extracted embeddings.
@@ -614,6 +784,8 @@ class KNNImageClassificationPipeline(ImageClassificationPipeline):
             raise ValueError("max_samples must be > 0")
         if n_neighbors <= 0:
             raise ValueError("n_neighbors must be > 0")
+        if debug_save_transformed_samples_count < 0:
+            raise ValueError("debug_save_transformed_samples_count must be >= 0")
         if grid_search:
             if grid_search_splits <= 1:
                 raise ValueError("grid_search_splits must be > 1 when grid_search=True.")
@@ -629,11 +801,13 @@ class KNNImageClassificationPipeline(ImageClassificationPipeline):
             raise ValueError("grid_search_scoring can only be set when grid_search=True.")
         if streaming and stratified:
             raise ValueError("stratified mode is only supported when streaming=False.")
+        if streaming and pre_shuffle:
+            raise ValueError("pre_shuffle is only supported when streaming=False.")
         resolved_pad_to_square = self._resolve_pad_to_square(pad_to_square)
         resolved_skip_channel_information = self._resolve_skip_channel_information(skip_channel_information)
 
         logger.info(
-            "Starting KNN training: split=%s image_column=%s label_column=%s batch_size=%d n_neighbors=%d streaming=%s stratified=%s shuffle=%s shuffle_seed=%d max_samples=%s",
+            "Starting KNN training: split=%s image_column=%s label_column=%s batch_size=%d n_neighbors=%d streaming=%s stratified=%s pre_shuffle=%s shuffle=%s shuffle_seed=%d max_samples=%s",
             split,
             image_column,
             label_column,
@@ -641,11 +815,18 @@ class KNNImageClassificationPipeline(ImageClassificationPipeline):
             n_neighbors,
             streaming,
             stratified,
+            pre_shuffle,
             shuffle,
             shuffle_seed,
             max_samples,
         )
-        dataset_obj = self._resolve_dataset(dataset=dataset, split=split, streaming=streaming)
+        dataset_obj = self._resolve_dataset(
+            dataset=dataset,
+            split=split,
+            streaming=streaming,
+            pre_shuffle=pre_shuffle,
+            shuffle_seed=shuffle_seed,
+        )
 
         if stratified:
             if not isinstance(dataset_obj, HFDataset):
@@ -679,6 +860,8 @@ class KNNImageClassificationPipeline(ImageClassificationPipeline):
             label_names=label_names,
             pad_to_square=resolved_pad_to_square,
             skip_channel_information=resolved_skip_channel_information,
+            debug_save_transformed_samples_dir=debug_save_transformed_samples_dir,
+            debug_save_transformed_samples_count=debug_save_transformed_samples_count,
         )
 
         try:
@@ -725,6 +908,7 @@ class KNNImageClassificationPipeline(ImageClassificationPipeline):
         num_workers: int = 1,
         streaming: bool = False,
         stratified: bool = False,
+        pre_shuffle: bool = False,
         shuffle: bool = False,
         shuffle_seed: int = 42,
         shuffle_buffer_size: int = 1000,
@@ -734,6 +918,9 @@ class KNNImageClassificationPipeline(ImageClassificationPipeline):
         positive_classes_population_ratio: float | None = None,
         pad_to_square: bool | None = None,
         skip_channel_information: str | None = None,
+        debug_save_transformed_samples_dir: str | Path | None = None,
+        debug_save_transformed_samples_count: int = 0,
+        reid_cmc_ranks: tuple[int, ...] = (1, 5, 10),
     ) -> dict[str, Any]:
         """Evaluate top-1 accuracy on a dataset or dataset split."""
         if self.knn_model is None:
@@ -748,10 +935,18 @@ class KNNImageClassificationPipeline(ImageClassificationPipeline):
             raise ValueError("max_samples must be > 0")
         if min_class_instances is not None and min_class_instances <= 0:
             raise ValueError("min_class_instances must be > 0")
+        if debug_save_transformed_samples_count < 0:
+            raise ValueError("debug_save_transformed_samples_count must be >= 0")
+        if not reid_cmc_ranks:
+            raise ValueError("reid_cmc_ranks must not be empty.")
+        if any(int(rank) <= 0 for rank in reid_cmc_ranks):
+            raise ValueError("All reid_cmc_ranks must be positive integers.")
         if positive_classes_population_ratio is not None and not (0.0 <= positive_classes_population_ratio <= 1.0):
             raise ValueError("positive_classes_population_ratio must be in [0.0, 1.0]")
         if streaming and stratified:
             raise ValueError("stratified mode is only supported when streaming=False.")
+        if streaming and pre_shuffle:
+            raise ValueError("pre_shuffle is only supported when streaming=False.")
         if streaming and (min_class_instances is not None or positive_classes_population_ratio is not None):
             raise ValueError(
                 "min_class_instances and positive_classes_population_ratio require streaming=False "
@@ -759,7 +954,13 @@ class KNNImageClassificationPipeline(ImageClassificationPipeline):
             )
         resolved_pad_to_square = self._resolve_pad_to_square(pad_to_square)
         resolved_skip_channel_information = self._resolve_skip_channel_information(skip_channel_information)
-        dataset_obj = self._resolve_dataset(dataset=dataset, split=split, streaming=streaming)
+        dataset_obj = self._resolve_dataset(
+            dataset=dataset,
+            split=split,
+            streaming=streaming,
+            pre_shuffle=pre_shuffle,
+            shuffle_seed=shuffle_seed,
+        )
         if stratified:
             if not isinstance(dataset_obj, HFDataset):
                 raise ValueError("stratified mode requires a non-streaming Hugging Face Dataset.")
@@ -793,10 +994,29 @@ class KNNImageClassificationPipeline(ImageClassificationPipeline):
                 positive_classes_population_ratio=positive_classes_population_ratio,
                 shuffle_seed=shuffle_seed,
             )
+        rank_positions: list[int] = []
+        eval_top_k = len(self.knn_model.classes_)
         rows: list[tuple[str, str, bool]] = []
         if isinstance(dataset_obj, HFDataset):
             if max_samples is not None:
                 dataset_obj = dataset_obj.select(range(min(max_samples, len(dataset_obj))))
+            if debug_save_transformed_samples_dir is not None and debug_save_transformed_samples_count > 0:
+                sample_count = min(debug_save_transformed_samples_count, len(dataset_obj))
+                raw_sample_images = cast(list[Any], dataset_obj[image_column][:sample_count])
+                transformed_samples = [
+                    self._prepare_image(
+                        image_value,
+                        pad_to_square=resolved_pad_to_square,
+                        skip_channel_information=resolved_skip_channel_information,
+                    )
+                    for image_value in raw_sample_images
+                ]
+                saved = self._save_debug_transformed_samples(
+                    images=transformed_samples,
+                    output_dir=debug_save_transformed_samples_dir,
+                    prefix="eval",
+                )
+                logger.info("Saved %d transformed eval debug samples to %s", saved, debug_save_transformed_samples_dir)
             y_true = [
                 str(self._normalize_label(raw_label, label_names)) for raw_label in cast(list[Any], dataset_obj[label_column])
             ]
@@ -805,33 +1025,65 @@ class KNNImageClassificationPipeline(ImageClassificationPipeline):
                 image_inputs,
                 batch_size=batch_size,
                 num_workers=num_workers,
+                top_k=eval_top_k,
                 pad_to_square=resolved_pad_to_square,
                 skip_channel_information=resolved_skip_channel_information,
             )
             for true_label, pred in tqdm(zip(y_true, pred_iter, strict=True), total=len(y_true), desc="Evaluating"):
-                pred_label = str(pred[0]["label"]) if isinstance(pred, list) else str(pred["label"])
+                pred_list = pred if isinstance(pred, list) else [pred]
+                pred_label = str(pred_list[0]["label"])
                 rows.append((true_label, pred_label, true_label == pred_label))
+                rank = next(
+                    (idx + 1 for idx, item in enumerate(pred_list) if str(item["label"]) == true_label),
+                    len(pred_list) + 1,
+                )
+                rank_positions.append(rank)
         else:
             dataset_for_eval = dataset_obj.take(max_samples) if max_samples is not None else dataset_obj
             true_labels: list[str] = []
+            debug_saved = 0
 
             def image_iter() -> Any:
+                nonlocal debug_saved
                 for row in dataset_for_eval:
                     true_labels.append(str(self._normalize_label(row[label_column], label_names)))
+                    if (
+                        debug_save_transformed_samples_dir is not None
+                        and debug_save_transformed_samples_count > 0
+                        and debug_saved < debug_save_transformed_samples_count
+                    ):
+                        transformed = self._prepare_image(
+                            row[image_column],
+                            pad_to_square=resolved_pad_to_square,
+                            skip_channel_information=resolved_skip_channel_information,
+                        )
+                        self._save_debug_transformed_samples(
+                            images=[transformed],
+                            output_dir=debug_save_transformed_samples_dir,
+                            prefix=f"eval_{debug_saved:03d}",
+                        )
+                        debug_saved += 1
                     yield row[image_column]
 
             pred_iter = self(
                 image_iter(),
                 batch_size=batch_size,
                 num_workers=num_workers,
+                top_k=eval_top_k,
                 pad_to_square=resolved_pad_to_square,
                 skip_channel_information=resolved_skip_channel_information,
             )
             total = max_samples
             for idx, pred in enumerate(tqdm(pred_iter, total=total, desc="Evaluating")):
                 true_label = true_labels[idx]
-                pred_label = str(pred[0]["label"]) if isinstance(pred, list) else str(pred["label"])
+                pred_list = pred if isinstance(pred, list) else [pred]
+                pred_label = str(pred_list[0]["label"])
                 rows.append((true_label, pred_label, true_label == pred_label))
+                rank = next(
+                    (rank_idx + 1 for rank_idx, item in enumerate(pred_list) if str(item["label"]) == true_label),
+                    len(pred_list) + 1,
+                )
+                rank_positions.append(rank)
 
         if not rows:
             raise ValueError("Dataset is empty; cannot evaluate.")
@@ -856,6 +1108,9 @@ class KNNImageClassificationPipeline(ImageClassificationPipeline):
             "true_label_counts": true_counts,
             "pred_label_counts": pred_counts,
         }
+        reid = self._compute_reid_metrics_from_rank_positions(rank_positions, cmc_ranks=reid_cmc_ranks)
+        metrics["reid_metrics"] = reid
+        logger.info("Re-identification metrics: %s", reid)
         logger.info("Evaluation complete: split=%s samples=%d top1_accuracy=%.4f", split, total, accuracy)
         logger.info("Classification report:\n%s", report_text)
         return metrics
@@ -1009,6 +1264,7 @@ def _train_pipeline_from_args(args: argparse.Namespace) -> KNNImageClassificatio
         num_workers=args.num_workers,
         streaming=args.stream,
         stratified=args.stratified,
+        pre_shuffle=args.pre_shuffle,
         shuffle=args.shuffle,
         shuffle_seed=args.shuffle_seed,
         shuffle_buffer_size=args.shuffle_buffer_size,
@@ -1020,6 +1276,8 @@ def _train_pipeline_from_args(args: argparse.Namespace) -> KNNImageClassificatio
         grid_search_scoring=args.grid_search_scoring,
         pad_to_square=pad_to_square,
         skip_channel_information=skip_channel_information,
+        debug_save_transformed_samples_dir=args.debug_save_transformed_samples_dir,
+        debug_save_transformed_samples_count=args.debug_save_transformed_samples_count,
         save_knn_model_path=args.knn_model_path,
     )
     return clf
@@ -1066,6 +1324,7 @@ def _run_cli_eval(args: argparse.Namespace) -> None:
         num_workers=args.num_workers,
         streaming=args.stream,
         stratified=args.stratified,
+        pre_shuffle=args.pre_shuffle,
         shuffle=args.shuffle,
         shuffle_seed=args.shuffle_seed,
         shuffle_buffer_size=args.shuffle_buffer_size,
@@ -1075,6 +1334,9 @@ def _run_cli_eval(args: argparse.Namespace) -> None:
         positive_classes_population_ratio=args.positive_classes_population_ratio,
         pad_to_square=pad_to_square,
         skip_channel_information=skip_channel_information,
+        debug_save_transformed_samples_dir=args.debug_save_transformed_samples_dir,
+        debug_save_transformed_samples_count=args.debug_save_transformed_samples_count,
+        reid_cmc_ranks=tuple(args.reid_cmc_ranks),
     )
     logger.info("Eval metrics: %s", metrics)
 
@@ -1105,6 +1367,14 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Enable stratified sampling (non-streaming only; uses --max-samples as subset size).",
     )
     train_parser.add_argument("--shuffle", action="store_true", help="Shuffle dataset before sampling/training.")
+    train_parser.add_argument(
+        "--pre-shuffle",
+        action="store_true",
+        help=(
+            "Shuffle base split deterministically before applying split-slice expressions "
+            "(example: train[80%:]). Uses --shuffle-seed."
+        ),
+    )
     train_parser.add_argument("--shuffle-seed", type=int, default=42, help="Shuffle seed.")
     train_parser.add_argument(
         "--shuffle-buffer-size",
@@ -1150,6 +1420,17 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         choices=["R", "G", "B"],
         default=None,
         help="Clone selected channel into all RGB channels before optional square padding.",
+    )
+    train_parser.add_argument(
+        "--debug-save-transformed-samples-dir",
+        default=None,
+        help="Optional output directory to save a few transformed train images for debugging.",
+    )
+    train_parser.add_argument(
+        "--debug-save-transformed-samples-count",
+        type=int,
+        default=0,
+        help="Number of transformed train images to save to --debug-save-transformed-samples-dir.",
     )
 
     infer_parser = subparsers.add_parser(
@@ -1222,6 +1503,14 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Enable stratified sampling (non-streaming only; uses --max-samples as subset size).",
     )
     eval_parser.add_argument("--shuffle", action="store_true", help="Shuffle dataset before evaluation.")
+    eval_parser.add_argument(
+        "--pre-shuffle",
+        action="store_true",
+        help=(
+            "Shuffle base split deterministically before applying split-slice expressions "
+            "(example: train[80%:]). Uses --shuffle-seed."
+        ),
+    )
     eval_parser.add_argument("--shuffle-seed", type=int, default=42, help="Shuffle seed.")
     eval_parser.add_argument(
         "--shuffle-buffer-size",
@@ -1263,6 +1552,23 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         choices=["R", "G", "B"],
         default=None,
         help="Clone selected channel into all RGB channels before optional square padding.",
+    )
+    eval_parser.add_argument(
+        "--debug-save-transformed-samples-dir",
+        default=None,
+        help="Optional output directory to save a few transformed eval images for debugging.",
+    )
+    eval_parser.add_argument(
+        "--debug-save-transformed-samples-count",
+        type=int,
+        default=0,
+        help="Number of transformed eval images to save to --debug-save-transformed-samples-dir.",
+    )
+    eval_parser.add_argument(
+        "--reid-cmc-ranks",
+        type=lambda value: [int(item.strip()) for item in value.split(",") if item.strip()],
+        default=[1, 5, 10],
+        help="Comma-separated CMC ranks for re-identification metrics (default: 1,5,10).",
     )
 
     return parser
