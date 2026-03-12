@@ -14,9 +14,13 @@
   "containerEnv": {
     "UV_PROJECT_ENVIRONMENT": "/tmp/uv-venv",
     "UV_CACHE_DIR": "/tmp/uv-cache",
-    "XDG_CACHE_HOME": "/tmp/.cache"
-
+    "XDG_CACHE_HOME": "/tmp/.cache",
+    "HF_TOKEN": "${localEnv:HF_TOKEN}",
+    "GH_TOKEN": "${localEnv:GH_TOKEN}"
   },
+  "mounts": [
+    "source=${localEnv:HOME}/.codex,target=/home/vscode/.codex,type=bind"
+  ],
   "customizations": {
     "vscode": {
       "extensions": [

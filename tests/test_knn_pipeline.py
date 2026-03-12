@@ -452,6 +452,27 @@ def test_evaluate_with_parametrized_batch_size(
     _assert_eval_metrics(metrics=metrics, labels=train_labels)
 
 
+def test_evaluate_with_reid_metrics(trained_case: dict[str, object]) -> None:
+    """Evaluate should always return class-ranking re-identification metrics."""
+    clf = trained_case["clf"]
+    dataset = trained_case["dataset"]
+    split = trained_case["split"] or "train"
+
+    metrics = clf.evaluate(
+        dataset=dataset,
+        split=split,
+        image_column="image",
+        label_column="label",
+        reid_cmc_ranks=(1, 2, 3),
+    )
+    reid = metrics["reid_metrics"]
+    assert reid["queries"] == metrics["samples"]
+    assert reid["mAP"] == 1.0
+    assert reid["cmc"]["cmc@1"] == 1.0
+    assert reid["cmc"]["cmc@2"] == 1.0
+    assert reid["cmc"]["cmc@3"] == 1.0
+
+
 def test_train_streaming_iterable_dataset(
     pipeline_factory,
     rng: np.random.Generator,
