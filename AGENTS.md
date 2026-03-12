@@ -58,6 +58,8 @@ Prefer one of these scopes when relevant:
 - Use imperative mood (`add`, `fix`, `remove`), not past tense.
 - Do not end subject line with a period.
 - Squash/fixup local commits before merge when practical.
+- When executing code, prefer showing progress when feasible. For Python, use
+  `tqdm` (or equivalent) to expose task progress.
 
 ## Why
 
@@ -72,3 +74,19 @@ uv build --wheel
 ```
 
 The built wheel is written to `dist/`.
+
+## Skills
+
+Repository-local skills are stored under `.agents/skills/`.
+
+### Available skills
+
+- `knn-cli-training`: Run KNN training from the CLI using either a Hugging Face
+  dataset ID or a local `imagefolder` path, including validation via `eval`.
+  (file: `.agents/skills/knn-cli-training/SKILL.md`)
+- `test-runner`: Run repository tests with `uv` including targeted and full
+  pytest commands.
+  (file: `.agents/skills/test-runner/SKILL.md`)
+- `git-commit`: Commit project changes with Conventional Commit messages and a
+  clean staged diff.
+  (file: `.agents/skills/git-commit/SKILL.md`)
