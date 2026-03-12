@@ -75,6 +75,77 @@ uv run python -m transformers_knn_adapter.knn_image_pipeline infer \
   --inference-batch-size 5
 ```
 
+## CLI Arguments
+
+### `train`
+
+| Argument | Required | Default | Description |
+|---|---:|---|---|
+| `--model` | Yes | - | HF model id/path for feature extraction |
+| `--knn-model-path` | Yes | - | Path to save/load KNN model (`.joblib`) |
+| `--dataset` | Yes | - | HF dataset name or local `imagefolder` path |
+| `--split` | No | `train` | Dataset split |
+| `--image-column` | No | `image` | Dataset image column |
+| `--label-column` | No | `label` | Dataset label column |
+| `--batch-size` | No | `16` | Embedding batch size |
+| `--stream` | No | `false` | Enable streaming mode |
+| `--stratified` | No | `false` | Stratified sampling (`--max-samples` subset size, non-streaming only) |
+| `--shuffle` | No | `false` | Shuffle dataset before sampling/training |
+| `--shuffle-seed` | No | `42` | Shuffle seed |
+| `--shuffle-buffer-size` | No | `1000` | Streaming shuffle buffer size |
+| `--max-samples` | No | `None` | Optional training sample cap |
+| `--n-neighbors` | No | `None` | KNN neighbors (mutually exclusive with `--grid-search`) |
+| `--grid-search` | No | `false` | Run `GridSearchCV` over neighbors/metrics |
+| `--grid-search-splits` | No | `None` | Stratified splits per repeat for grid search |
+| `--grid-search-repeats` | No | `None` | Repeat count for stratified folds in grid search |
+| `--grid-search-scoring` | No | `None` | Grid-search scoring metric (`f1_macro`, `precision_macro`, `recall_macro`) |
+| `--top-k` | No | `2` | Top-k at inference time |
+| `--device` | No | `-1` | Transformers device index (`-1` for CPU) |
+
+### `eval`
+
+| Argument | Required | Default | Description |
+|---|---:|---|---|
+| `--model` | Yes | - | HF model id/path for feature extraction |
+| `--knn-model-path` | Yes | - | Path to trained KNN model (`.joblib`) |
+| `--dataset` | Yes | - | HF dataset name or local `imagefolder` path |
+| `--split` | No | `validation` | Dataset split |
+| `--image-column` | No | `image` | Dataset image column |
+| `--label-column` | No | `label` | Dataset label column |
+| `--batch-size` | No | `16` | Embedding batch size |
+| `--stream` | No | `false` | Enable streaming mode |
+| `--stratified` | No | `false` | Stratified sampling (`--max-samples` subset size, non-streaming only) |
+| `--shuffle` | No | `false` | Shuffle dataset before evaluation |
+| `--shuffle-seed` | No | `42` | Shuffle seed |
+| `--shuffle-buffer-size` | No | `1000` | Streaming shuffle buffer size |
+| `--max-samples` | No | `None` | Optional evaluation sample cap |
+| `--min-class-instances` | No | `None` | Drop classes with fewer than this number of eval instances |
+| `--negative-classes` | No | `other` | Comma-separated classes treated as negative |
+| `--positive-classes-population-ratio` | No | `None` | Target positive/(total) ratio after subsampling |
+| `--top-k` | No | `1` | Top-k predictions (evaluation uses top-1) |
+| `--device` | No | `-1` | Transformers device index (`-1` for CPU) |
+
+### `infer`
+
+| Argument | Required | Default | Description |
+|---|---:|---|---|
+| `--model` | Yes | - | HF model id/path for feature extraction |
+| `--knn-model-path` | Yes | - | Path to save/load KNN model (`.joblib`) |
+| `--top-k` | No | `3` | Top-k predictions |
+| `--device` | No | `-1` | Transformers device index (`-1` for CPU) |
+| `--image` | No | `https://picsum.photos/200` | Image input (file path or URL) |
+| `--inference-batch-size` | No | `5` | Number of images for batched inference |
+
+### `predict`
+
+| Argument | Required | Default | Description |
+|---|---:|---|---|
+| `--model` | Yes | - | HF model id/path for feature extraction |
+| `--knn-model-path` | Yes | - | Path to trained KNN model (`.joblib`) |
+| `--image` | Yes | - | Image path/URL accepted by Transformers image pipeline |
+| `--top-k` | No | `3` | Top-k predictions |
+| `--device` | No | `-1` | Transformers device index (`-1` for CPU) |
+
 ## Python API
 
 ```python

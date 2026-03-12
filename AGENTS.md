@@ -62,3 +62,13 @@ Prefer one of these scopes when relevant:
 ## Why
 
 This repository uses automated release/versioning workflows. Conventional Commits keep changelogs and semantic version bumps predictable.
+
+## Build Wheel Locally
+
+Use `uv` to build the wheel from the repository root:
+
+```bash
+uv build --wheel
+```
+
+The built wheel is written to `dist/`.
