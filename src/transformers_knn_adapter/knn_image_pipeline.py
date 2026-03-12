@@ -33,6 +33,7 @@ from transformers import AutoImageProcessor, AutoModel
 from transformers import pipeline as hf_pipeline
 from transformers.image_utils import load_image
 from transformers.pipelines import ImageClassificationPipeline
+from transformers.pipelines.pt_utils import KeyDataset
 
 logger = logging.getLogger(__name__)
 GRID_SEARCH_ALLOWED_SCORING = {"f1_macro", "precision_macro", "recall_macro"}
@@ -118,6 +119,33 @@ class KNNImageClassificationPipeline(ImageClassificationPipeline):
         source = rgb_image.split()[channel_to_index[channel]]
         return Image.merge("RGB", (source, source, source))
 
+    @staticmethod
+    def _apply_image_transforms(
+        image: Image.Image,
+        *,
+        pad_to_square: bool,
+        skip_channel_information: str | None,
+    ) -> Image.Image:
+        if skip_channel_information is not None:
+            image = KNNImageClassificationPipeline._clone_channel_to_rgb(image, skip_channel_information)
+        if pad_to_square:
+            image = KNNImageClassificationPipeline._pad_image_to_square(image)
+        return image
+
+    @staticmethod
+    def _prepare_image_static(
+        image_value: Any,
+        *,
+        pad_to_square: bool,
+        skip_channel_information: str | None,
+    ) -> Image.Image:
+        image = KNNImageClassificationPipeline._coerce_image(image_value)
+        return KNNImageClassificationPipeline._apply_image_transforms(
+            image,
+            pad_to_square=pad_to_square,
+            skip_channel_information=skip_channel_information,
+        )
+
     def _prepare_image(
         self,
         image_value: Any,
@@ -125,12 +153,11 @@ class KNNImageClassificationPipeline(ImageClassificationPipeline):
         pad_to_square: bool,
         skip_channel_information: str | None,
     ) -> Image.Image:
-        image = self._coerce_image(image_value)
-        if skip_channel_information is not None:
-            image = self._clone_channel_to_rgb(image, skip_channel_information)
-        if pad_to_square:
-            return self._pad_image_to_square(image)
-        return image
+        return self._prepare_image_static(
+            image_value,
+            pad_to_square=pad_to_square,
+            skip_channel_information=skip_channel_information,
+        )
 
     def _resolve_pad_to_square(self, pad_to_square: bool | None) -> bool:
         if pad_to_square is None:
@@ -323,51 +350,35 @@ class KNNImageClassificationPipeline(ImageClassificationPipeline):
             )
         return dataset_obj
 
-    def _iter_dataset_batches(
+    def _extract_cls_embedding_from_feature_output(self, feature_output: Any) -> np.ndarray:
+        features_np = np.asarray(feature_output, dtype=np.float32)
+        while features_np.ndim > 2 and features_np.shape[0] == 1:
+            features_np = features_np[0]
+        if features_np.ndim == 2:
+            return features_np[0]
+        if features_np.ndim == 1:
+            return features_np
+        raise ValueError(f"Unexpected feature output shape: {features_np.shape}")
+
+    def _map_dataset_images_for_training(
         self,
         *,
-        dataset_obj: HFDataset | IterableDataset,
+        dataset_obj: HFDataset,
         image_column: str,
-        label_column: str,
-        batch_size: int,
-        max_samples: int | None,
-    ) -> tuple[Any, int | None, int | None]:
-        if isinstance(dataset_obj, IterableDataset):
-            dataset_for_batches = dataset_obj.take(max_samples) if max_samples is not None else dataset_obj
-            batched_iter: Any = dataset_for_batches.batch(batch_size=batch_size)
-            total_samples = max_samples
-            total_batches = math.ceil(total_samples / batch_size) if total_samples is not None else None
-            return batched_iter, total_samples, total_batches
-
-        if max_samples is not None:
-            dataset_obj = dataset_obj.select(range(min(max_samples, len(dataset_obj))))
-        total_samples = len(dataset_obj)
-        total_batches = math.ceil(total_samples / batch_size)
-        batched_iter = (
-            {
-                image_column: batch[image_column],
-                label_column: batch[label_column],
-            }
-            for start in range(0, total_samples, batch_size)
-            for batch in [dataset_obj[start : min(start + batch_size, total_samples)]]
-        )
-        return batched_iter, total_samples, total_batches
-
-    def _prepare_batch_images(
-        self,
-        image_values: list[Any],
-        *,
         pad_to_square: bool,
         skip_channel_information: str | None,
-    ) -> list[Image.Image]:
-        return [
-            self._prepare_image(
-                image_value,
+        num_workers: int,
+    ) -> HFDataset:
+        def _transform_row(row: dict[str, Any]) -> dict[str, Any]:
+            image = KNNImageClassificationPipeline._prepare_image_static(
+                row[image_column],
                 pad_to_square=pad_to_square,
                 skip_channel_information=skip_channel_information,
             )
-            for image_value in image_values
-        ]
+            return {image_column: image}
+
+        num_proc = num_workers if num_workers > 1 else None
+        return dataset_obj.map(_transform_row, desc="Applying image transforms", num_proc=num_proc)
 
     def _extract_embeddings_from_images(self, images: list[Image.Image]) -> np.ndarray:
         raw_features = self.feature_extraction_pipeline(images, batch_size=len(images))
@@ -394,6 +405,7 @@ class KNNImageClassificationPipeline(ImageClassificationPipeline):
         image_column: str,
         label_column: str,
         batch_size: int,
+        num_workers: int,
         max_samples: int | None,
         label_names: list[str] | None,
         pad_to_square: bool,
@@ -405,53 +417,75 @@ class KNNImageClassificationPipeline(ImageClassificationPipeline):
         embeddings_mm: np.memmap | None = None
         memmap_path: str | None = None
         write_idx = 0
-        labels: list[Any] = []
+        labels: list[Any]
         loaded = 0
-        batched_iter, total_samples, total_batches = self._iter_dataset_batches(
-            dataset_obj=dataset_obj,
-            image_column=image_column,
-            label_column=label_column,
-            batch_size=batch_size,
-            max_samples=max_samples,
-        )
-
-        for batch in tqdm(
-            batched_iter,
-            total=total_batches,
-            desc="Extracting train embeddings",
-        ):
-            image_values = batch[image_column]
-            label_values = batch[label_column]
-            batch_images = self._prepare_batch_images(
-                image_values,
+        if isinstance(dataset_obj, HFDataset):
+            if max_samples is not None:
+                dataset_obj = dataset_obj.select(range(min(max_samples, len(dataset_obj))))
+            labels = [
+                self._normalize_label(raw_label, label_names) for raw_label in cast(list[Any], dataset_obj[label_column])
+            ]
+            total_samples: int | None = len(labels)
+            transformed_dataset = self._map_dataset_images_for_training(
+                dataset_obj=dataset_obj,
+                image_column=image_column,
                 pad_to_square=pad_to_square,
                 skip_channel_information=skip_channel_information,
+                num_workers=num_workers,
             )
-            labels.extend(self._normalize_label(raw_label, label_names) for raw_label in label_values)
-            loaded += len(label_values)
-            embeddings = self._extract_embeddings_from_images(batch_images)
+            raw_images: Any = KeyDataset(transformed_dataset, image_column)
+            feature_iter = self.feature_extraction_pipeline(
+                raw_images,
+                batch_size=batch_size,
+                num_workers=num_workers,
+            )
+        else:
+            labels = []
+            dataset_for_iter = dataset_obj.take(max_samples) if max_samples is not None else dataset_obj
+            total_samples = max_samples
+
+            def image_iter() -> Any:
+                for row in dataset_for_iter:
+                    labels.append(self._normalize_label(row[label_column], label_names))
+                    yield self._prepare_image(
+                        row[image_column],
+                        pad_to_square=pad_to_square,
+                        skip_channel_information=skip_channel_information,
+                    )
+
+            feature_iter = self.feature_extraction_pipeline(
+                image_iter(),
+                batch_size=batch_size,
+                num_workers=num_workers,
+            )
+
+        for feature_output in tqdm(feature_iter, total=total_samples, desc="Extracting train embeddings"):
+            embedding = self._extract_cls_embedding_from_feature_output(feature_output).reshape(1, -1)
+            loaded += 1
             if total_samples is not None:
                 if embeddings_mm is None:
                     with tempfile.NamedTemporaryFile(prefix="knn_emb_", suffix=".mmap", delete=False) as f:
                         memmap_path = f.name
                     embeddings_mm = np.memmap(
                         memmap_path,
-                        dtype=embeddings.dtype,
+                        dtype=embedding.dtype,
                         mode="w+",
-                        shape=(int(total_samples), embeddings.shape[1]),
+                        shape=(int(total_samples), embedding.shape[1]),
                     )
                     logger.info("Using memory-mapped embedding storage at %s", memmap_path)
-                next_idx = write_idx + embeddings.shape[0]
-                embeddings_mm[write_idx:next_idx] = embeddings
-                write_idx = next_idx
+                embeddings_mm[write_idx] = embedding[0]
+                write_idx += 1
             else:
-                # When total sample count is unknown, fallback to in-memory chunks.
-                embedding_batches.append(embeddings)
-            logger.debug("Processed embedding batch size=%d", len(batch_images))
+                embedding_batches.append(embedding)
 
         if loaded == 0:
             raise ValueError("Dataset is empty; cannot train KNN.")
         logger.info("Loaded %d items for training", loaded)
+
+        if loaded != len(labels):
+            raise ValueError(
+                f"Mismatch between extracted embeddings ({loaded}) and labels ({len(labels)})."
+            )
 
         if embeddings_mm is not None:
             embeddings_mm.flush()
@@ -544,6 +578,7 @@ class KNNImageClassificationPipeline(ImageClassificationPipeline):
         image_column: str = "image",
         label_column: str = "label",
         batch_size: int = 16,
+        num_workers: int = 1,
         streaming: bool = False,
         stratified: bool = False,
         shuffle: bool = False,
@@ -571,6 +606,8 @@ class KNNImageClassificationPipeline(ImageClassificationPipeline):
         """
         if batch_size <= 0:
             raise ValueError("batch_size must be > 0")
+        if num_workers < 0:
+            raise ValueError("num_workers must be >= 0")
         if shuffle_buffer_size <= 0:
             raise ValueError("shuffle_buffer_size must be > 0")
         if max_samples is not None and max_samples <= 0:
@@ -637,6 +674,7 @@ class KNNImageClassificationPipeline(ImageClassificationPipeline):
             image_column=image_column,
             label_column=label_column,
             batch_size=batch_size,
+            num_workers=num_workers,
             max_samples=max_samples,
             label_names=label_names,
             pad_to_square=resolved_pad_to_square,
@@ -684,6 +722,7 @@ class KNNImageClassificationPipeline(ImageClassificationPipeline):
         image_column: str = "image",
         label_column: str = "label",
         batch_size: int = 16,
+        num_workers: int = 1,
         streaming: bool = False,
         stratified: bool = False,
         shuffle: bool = False,
@@ -701,6 +740,8 @@ class KNNImageClassificationPipeline(ImageClassificationPipeline):
             raise ValueError("KNN head is not loaded. Provide knn_model_path or call train(...) first.")
         if batch_size <= 0:
             raise ValueError("batch_size must be > 0")
+        if num_workers < 0:
+            raise ValueError("num_workers must be >= 0")
         if shuffle_buffer_size <= 0:
             raise ValueError("shuffle_buffer_size must be > 0")
         if max_samples is not None and max_samples <= 0:
@@ -752,37 +793,44 @@ class KNNImageClassificationPipeline(ImageClassificationPipeline):
                 positive_classes_population_ratio=positive_classes_population_ratio,
                 shuffle_seed=shuffle_seed,
             )
-
-        batched_iter, _, total_batches = self._iter_dataset_batches(
-            dataset_obj=dataset_obj,
-            image_column=image_column,
-            label_column=label_column,
-            batch_size=batch_size,
-            max_samples=max_samples,
-        )
-
         rows: list[tuple[str, str, bool]] = []
-        for batch in tqdm(batched_iter, total=total_batches, desc="Evaluating"):
-            image_values = batch[image_column]
-            label_values = batch[label_column]
-            batch_images = self._prepare_batch_images(
-                image_values,
+        if isinstance(dataset_obj, HFDataset):
+            if max_samples is not None:
+                dataset_obj = dataset_obj.select(range(min(max_samples, len(dataset_obj))))
+            y_true = [
+                str(self._normalize_label(raw_label, label_names)) for raw_label in cast(list[Any], dataset_obj[label_column])
+            ]
+            image_inputs: Any = KeyDataset(dataset_obj, image_column)
+            pred_iter = self(
+                image_inputs,
+                batch_size=batch_size,
+                num_workers=num_workers,
                 pad_to_square=resolved_pad_to_square,
                 skip_channel_information=resolved_skip_channel_information,
             )
-            batch_pred = self(
-                batch_images,
+            for true_label, pred in tqdm(zip(y_true, pred_iter, strict=True), total=len(y_true), desc="Evaluating"):
+                pred_label = str(pred[0]["label"]) if isinstance(pred, list) else str(pred["label"])
+                rows.append((true_label, pred_label, true_label == pred_label))
+        else:
+            dataset_for_eval = dataset_obj.take(max_samples) if max_samples is not None else dataset_obj
+            true_labels: list[str] = []
+
+            def image_iter() -> Any:
+                for row in dataset_for_eval:
+                    true_labels.append(str(self._normalize_label(row[label_column], label_names)))
+                    yield row[image_column]
+
+            pred_iter = self(
+                image_iter(),
+                batch_size=batch_size,
+                num_workers=num_workers,
                 pad_to_square=resolved_pad_to_square,
                 skip_channel_information=resolved_skip_channel_information,
             )
-
-            if batch_pred and isinstance(batch_pred[0], dict):
-                pred_labels = [str(batch_pred[0]["label"])]
-            else:
-                pred_labels = [str(pred[0]["label"]) for pred in batch_pred]
-
-            for true_raw, pred_label in zip(label_values, pred_labels, strict=True):
-                true_label = str(self._normalize_label(true_raw, label_names))
+            total = max_samples
+            for idx, pred in enumerate(tqdm(pred_iter, total=total, desc="Evaluating")):
+                true_label = true_labels[idx]
+                pred_label = str(pred[0]["label"]) if isinstance(pred, list) else str(pred["label"])
                 rows.append((true_label, pred_label, true_label == pred_label))
 
         if not rows:
@@ -920,12 +968,14 @@ def _validate_cli_train_args(args: argparse.Namespace) -> None:
         raise ValueError("--grid-search-scoring is required when --grid-search is enabled.")
 
 
-def _train_pipeline_from_args(args: argparse.Namespace) -> KNNImageClassificationPipeline:
-    """Build and train a pipeline instance from parsed CLI arguments."""
-    _validate_cli_train_args(args)
+def _resolve_cli_image_options(args: argparse.Namespace) -> tuple[bool, str | None]:
     pad_to_square = bool(getattr(args, "pad_to_square", False))
     skip_channel_information = cast(str | None, getattr(args, "skip_channel_information", None))
+    return pad_to_square, skip_channel_information
 
+
+def _build_pipeline_from_args(args: argparse.Namespace) -> tuple[KNNImageClassificationPipeline, bool, str | None]:
+    pad_to_square, skip_channel_information = _resolve_cli_image_options(args)
     clf = pipeline(
         "image-classification",
         model_path=args.model,
@@ -935,6 +985,13 @@ def _train_pipeline_from_args(args: argparse.Namespace) -> KNNImageClassificatio
         pad_to_square=pad_to_square,
         skip_channel_information=skip_channel_information,
     )
+    return clf, pad_to_square, skip_channel_information
+
+
+def _train_pipeline_from_args(args: argparse.Namespace) -> KNNImageClassificationPipeline:
+    """Build and train a pipeline instance from parsed CLI arguments."""
+    _validate_cli_train_args(args)
+    clf, pad_to_square, skip_channel_information = _build_pipeline_from_args(args)
 
     logger.info(
         "CLI train using dataset=%s split=%s image_column=%s label_column=%s",
@@ -949,6 +1006,7 @@ def _train_pipeline_from_args(args: argparse.Namespace) -> KNNImageClassificatio
         image_column=args.image_column,
         label_column=args.label_column,
         batch_size=args.batch_size,
+        num_workers=args.num_workers,
         streaming=args.stream,
         stratified=args.stratified,
         shuffle=args.shuffle,
@@ -978,17 +1036,7 @@ def _run_cli_infer(args: argparse.Namespace) -> None:
     """Handle the `infer` CLI command using an already-trained KNN model."""
     if args.inference_batch_size <= 0:
         raise ValueError("--inference-batch-size must be > 0.")
-    pad_to_square = bool(getattr(args, "pad_to_square", False))
-    skip_channel_information = cast(str | None, getattr(args, "skip_channel_information", None))
-    clf = pipeline(
-        "image-classification",
-        model_path=args.model,
-        knn_model_path=args.knn_model_path,
-        device=args.device,
-        top_k=args.top_k,
-        pad_to_square=pad_to_square,
-        skip_channel_information=skip_channel_information,
-    )
+    clf, pad_to_square, skip_channel_information = _build_pipeline_from_args(args)
     image_input = args.image
     image_batch = [image_input for _ in range(args.inference_batch_size)]
     single_result = clf(image_input, pad_to_square=pad_to_square, skip_channel_information=skip_channel_information)
@@ -1001,40 +1049,21 @@ def _run_cli_infer(args: argparse.Namespace) -> None:
 
 def _run_cli_predict(args: argparse.Namespace) -> None:
     """Handle the `predict` CLI command."""
-    pad_to_square = bool(getattr(args, "pad_to_square", False))
-    skip_channel_information = cast(str | None, getattr(args, "skip_channel_information", None))
-    clf = pipeline(
-        "image-classification",
-        model_path=args.model,
-        knn_model_path=args.knn_model_path,
-        device=args.device,
-        top_k=args.top_k,
-        pad_to_square=pad_to_square,
-        skip_channel_information=skip_channel_information,
-    )
+    clf, pad_to_square, skip_channel_information = _build_pipeline_from_args(args)
     result = clf(args.image, pad_to_square=pad_to_square, skip_channel_information=skip_channel_information)
     logger.info("Prediction result: %s", result)
 
 
 def _run_cli_eval(args: argparse.Namespace) -> None:
     """Handle the `eval` CLI command."""
-    pad_to_square = bool(getattr(args, "pad_to_square", False))
-    skip_channel_information = cast(str | None, getattr(args, "skip_channel_information", None))
-    clf = pipeline(
-        "image-classification",
-        model_path=args.model,
-        knn_model_path=args.knn_model_path,
-        device=args.device,
-        top_k=args.top_k,
-        pad_to_square=pad_to_square,
-        skip_channel_information=skip_channel_information,
-    )
+    clf, pad_to_square, skip_channel_information = _build_pipeline_from_args(args)
     metrics = clf.evaluate(
         dataset=args.dataset,
         split=args.split,
         image_column=args.image_column,
         label_column=args.label_column,
         batch_size=args.batch_size,
+        num_workers=args.num_workers,
         streaming=args.stream,
         stratified=args.stratified,
         shuffle=args.shuffle,
@@ -1067,6 +1096,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     train_parser.add_argument("--image-column", default="image", help="Dataset image column.")
     train_parser.add_argument("--label-column", default="label", help="Dataset label column.")
     train_parser.add_argument("--batch-size", type=int, default=16, help="Embedding batch size.")
+    train_parser.add_argument("--num-workers", type=int, default=1, help="HF pipeline dataloader workers.")
     stream_group = train_parser.add_mutually_exclusive_group()
     stream_group.add_argument("--stream", action="store_true", help="Enable HF dataset streaming mode.")
     stream_group.add_argument(
@@ -1183,6 +1213,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     eval_parser.add_argument("--image-column", default="image", help="Dataset image column.")
     eval_parser.add_argument("--label-column", default="label", help="Dataset label column.")
     eval_parser.add_argument("--batch-size", type=int, default=16, help="Embedding batch size.")
+    eval_parser.add_argument("--num-workers", type=int, default=1, help="HF pipeline dataloader workers.")
     eval_stream_group = eval_parser.add_mutually_exclusive_group()
     eval_stream_group.add_argument("--stream", action="store_true", help="Enable HF dataset streaming mode.")
     eval_stream_group.add_argument(

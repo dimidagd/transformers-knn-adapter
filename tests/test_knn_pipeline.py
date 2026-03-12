@@ -470,6 +470,37 @@ def test_train_streaming_iterable_dataset(
     _assert_knn_classes(case["clf"], set(EXPECTED_CLASSES))
 
 
+def test_train_forwards_non_default_num_workers_to_feature_pipeline(
+    tmp_path: Path,
+    rng: np.random.Generator,
+) -> None:
+    """Train should forward configured num_workers to HF feature-extraction pipeline."""
+    dataset, _ = get_hf_dataset(rng=rng, num_samples=12)
+    clf, _ = _build_local_pipeline(tmp_path, model_class=ViTModel)
+    seen: dict[str, int] = {}
+
+    def fake_feature_pipeline(inputs: Any, **kwargs: Any) -> Any:
+        seen["num_workers"] = int(kwargs.get("num_workers", -1))
+        seen["batch_size"] = int(kwargs.get("batch_size", -1))
+        for idx, _ in enumerate(inputs):
+            embedding = [0.0, 0.0, 0.0]
+            embedding[idx % 3] = 1.0
+            yield [embedding]
+
+    clf.feature_extraction_pipeline = fake_feature_pipeline
+    clf.train(
+        dataset=dataset,
+        split="train",
+        image_column="image",
+        label_column="label",
+        batch_size=4,
+        num_workers=2,
+        n_neighbors=1,
+    )
+    assert seen["num_workers"] == 2
+    assert seen["batch_size"] == 4
+
+
 def test_pad_image_to_square_returns_square_with_black_padding() -> None:
     """Square padding should keep content centered and fill margins with black."""
     image = Image.new("RGB", (10, 4), (255, 0, 0))
