@@ -474,26 +474,6 @@ class KNNImageClassificationPipeline(ImageClassificationPipeline):
             saved += 1
         return saved
 
-    def _map_dataset_images_for_training(
-        self,
-        *,
-        dataset_obj: HFDataset,
-        image_column: str,
-        pad_to_square: bool,
-        skip_channel_information: str | None,
-        num_workers: int,
-    ) -> HFDataset:
-        def _transform_row(row: dict[str, Any]) -> dict[str, Any]:
-            image = KNNImageClassificationPipeline._prepare_image_static(
-                row[image_column],
-                pad_to_square=pad_to_square,
-                skip_channel_information=skip_channel_information,
-            )
-            return {image_column: image}
-
-        num_proc = num_workers if num_workers > 1 else None
-        return dataset_obj.map(_transform_row, desc="Applying image transforms", num_proc=num_proc)
-
     def _extract_embeddings_from_images(self, images: list[Image.Image]) -> np.ndarray:
         raw_features = self.feature_extraction_pipeline(images, batch_size=len(images))
         features_np = np.asarray(raw_features, dtype=np.float32)
@@ -533,7 +513,7 @@ class KNNImageClassificationPipeline(ImageClassificationPipeline):
         embeddings_mm: np.memmap | None = None
         memmap_path: str | None = None
         write_idx = 0
-        labels: list[Any]
+        labels: list[Any] = []
         loaded = 0
         if isinstance(dataset_obj, HFDataset):
             if max_samples is not None:
@@ -541,37 +521,52 @@ class KNNImageClassificationPipeline(ImageClassificationPipeline):
             labels = [
                 self._normalize_label(raw_label, label_names) for raw_label in cast(list[Any], dataset_obj[label_column])
             ]
-            total_samples: int | None = len(labels)
-            transformed_dataset = self._map_dataset_images_for_training(
-                dataset_obj=dataset_obj,
-                image_column=image_column,
-                pad_to_square=pad_to_square,
-                skip_channel_information=skip_channel_information,
-                num_workers=num_workers,
-            )
+            total_samples: int | None = len(dataset_obj)
+
+            def _transform_row(row: dict[str, Any]) -> dict[str, Any]:
+                image_value = row[image_column]
+                if isinstance(image_value, list):
+                    transformed_images = [
+                        self._prepare_image(
+                            img,
+                            pad_to_square=pad_to_square,
+                            skip_channel_information=skip_channel_information,
+                        )
+                        for img in image_value
+                    ]
+                    row[image_column] = transformed_images
+                    return row
+                row[image_column] = self._prepare_image(
+                    image_value,
+                    pad_to_square=pad_to_square,
+                    skip_channel_information=skip_channel_information,
+                )
+                return row
+
+            transformed_dataset = dataset_obj.with_transform(_transform_row)
             if debug_save_transformed_samples_dir is not None and debug_save_transformed_samples_count > 0:
                 sample_count = min(debug_save_transformed_samples_count, len(transformed_dataset))
-                sample_images = cast(list[Any], transformed_dataset[image_column][:sample_count])
+                transformed_images = [transformed_dataset[idx][image_column] for idx in range(sample_count)]
                 saved = self._save_debug_transformed_samples(
-                    images=sample_images,
+                    images=transformed_images,
                     output_dir=debug_save_transformed_samples_dir,
                     prefix="train",
                 )
                 logger.info("Saved %d transformed train debug samples to %s", saved, debug_save_transformed_samples_dir)
-            raw_images: Any = KeyDataset(transformed_dataset, image_column)
             feature_iter = self.feature_extraction_pipeline(
-                raw_images,
+                KeyDataset(transformed_dataset, image_column),
                 batch_size=batch_size,
                 num_workers=num_workers,
             )
         else:
-            labels = []
             dataset_for_iter = dataset_obj.take(max_samples) if max_samples is not None else dataset_obj
             total_samples = max_samples
-            debug_saved = 0
+            if debug_save_transformed_samples_dir is not None and debug_save_transformed_samples_count > 0:
+                logger.warning(
+                    "debug_save_transformed_samples_* for train is currently supported only for non-streaming HFDataset."
+                )
 
             def image_iter() -> Any:
-                nonlocal debug_saved
                 for row in dataset_for_iter:
                     labels.append(self._normalize_label(row[label_column], label_names))
                     image = self._prepare_image(
@@ -579,17 +574,6 @@ class KNNImageClassificationPipeline(ImageClassificationPipeline):
                         pad_to_square=pad_to_square,
                         skip_channel_information=skip_channel_information,
                     )
-                    if (
-                        debug_save_transformed_samples_dir is not None
-                        and debug_save_transformed_samples_count > 0
-                        and debug_saved < debug_save_transformed_samples_count
-                    ):
-                        self._save_debug_transformed_samples(
-                            images=[image],
-                            output_dir=debug_save_transformed_samples_dir,
-                            prefix=f"train_{debug_saved:03d}",
-                        )
-                        debug_saved += 1
                     yield image
 
             feature_iter = self.feature_extraction_pipeline(
@@ -1372,7 +1356,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "Shuffle base split deterministically before applying split-slice expressions "
-            "(example: train[80%:]). Uses --shuffle-seed."
+            "(example: train[80%%:]). Uses --shuffle-seed."
         ),
     )
     train_parser.add_argument("--shuffle-seed", type=int, default=42, help="Shuffle seed.")
@@ -1508,7 +1492,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "Shuffle base split deterministically before applying split-slice expressions "
-            "(example: train[80%:]). Uses --shuffle-seed."
+            "(example: train[80%%:]). Uses --shuffle-seed."
         ),
     )
     eval_parser.add_argument("--shuffle-seed", type=int, default=42, help="Shuffle seed.")
