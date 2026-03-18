@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from typing import Any
+from typing import Any, cast
 
 import torch
 import torch.nn.functional as F
@@ -33,7 +33,7 @@ class Dinov2ForImageClassificationWithArcFaceLoss(Dinov2ForImageClassification):
         self.use_focal_loss = bool(getattr(config, "use_focal_loss", False))
         self.focal_loss_alpha = getattr(config, "focal_loss_alpha", 0.25)
         self.focal_loss_gamma = float(getattr(config, "focal_loss_gamma", 2.0))
-        self.arcface_loss = self._build_arcface_loss(
+        self.arcface_loss: Any = self._build_arcface_loss(
             num_classes=config.num_labels,
             embedding_size=embedding_size,
             margin=self.arcface_margin,
@@ -51,12 +51,16 @@ class Dinov2ForImageClassificationWithArcFaceLoss(Dinov2ForImageClassification):
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path: str | os.PathLike | None, *model_args, **kwargs):
         output_loading_info = kwargs.pop("output_loading_info", False)
-        model, loading_info = super().from_pretrained(
-            pretrained_model_name_or_path,
-            *model_args,
-            output_loading_info=True,
-            **kwargs,
+        loaded = cast(
+            tuple[Dinov2ForImageClassificationWithArcFaceLoss, dict[str, Any]],
+            super().from_pretrained(
+                pretrained_model_name_or_path,
+                *model_args,
+                output_loading_info=True,
+                **kwargs,
+            ),
         )
+        model, loading_info = loaded
         weight = getattr(model.arcface_loss, "W", None)
         missing_keys = set(loading_info.get("missing_keys", ()))
         if "arcface_loss.W" in missing_keys or weight is None or not torch.isfinite(weight).all():
@@ -204,8 +208,8 @@ class Dinov2ForImageClassificationWithArcFaceLoss(Dinov2ForImageClassification):
         logits = self.compute_inference_logits(embeddings)
 
         return ImageClassifierOutput(
-            loss=loss,
-            logits=logits,
+            loss=cast(Any, loss),
+            logits=cast(Any, logits),
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
         )

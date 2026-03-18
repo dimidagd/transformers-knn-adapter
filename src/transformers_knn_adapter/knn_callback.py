@@ -215,12 +215,12 @@ class KNNCallback(TrainerCallback):
             embeddings_batches.append(embeddings.detach().cpu().numpy())
             labels_batches.append(labels.numpy())
 
-        embeddings = np.concatenate(embeddings_batches, axis=0)
-        labels = np.concatenate(labels_batches, axis=0)
-        self._ensure_finite(f"{split_name} embeddings", embeddings)
-        return embeddings, labels
+        embeddings_array = np.concatenate(embeddings_batches, axis=0)
+        labels_array = np.concatenate(labels_batches, axis=0)
+        self._ensure_finite(f"{split_name} embeddings", embeddings_array)
+        return embeddings_array, labels_array
 
-    def on_evaluate(self, args, state, control, **kwargs):  # type: ignore[override]
+    def on_evaluate(self, args, state, control, **kwargs):
         metrics = kwargs.get("metrics")
         if metrics is None:
             return control

@@ -124,13 +124,13 @@ class FreezeScheduleCallback(TrainerCallback):
         if self.trainer is not None:
             self.trainer.log({self.metric_name: float(trainable_params)})
 
-    def on_train_begin(self, args, state, control, **kwargs):  # type: ignore[override]
+    def on_train_begin(self, args, state, control, **kwargs):
         del args
         model = kwargs.get("model")
         self._apply(model, epoch=0.0)
         return control
 
-    def on_epoch_begin(self, args, state, control, **kwargs):  # type: ignore[override]
+    def on_epoch_begin(self, args, state, control, **kwargs):
         del args
         model = kwargs.get("model")
         current_epoch = 0.0 if state.epoch is None else float(state.epoch)
