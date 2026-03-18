@@ -4,6 +4,20 @@ All notable changes to this project will be documented in this file.
 
 This changelog is automatically managed by release-please from commits merged into `main`.
 
+## [0.6.0](https://github.com/dimidagd/transformers-knn-adapter/compare/v0.5.0...v0.6.0) (2026-03-18)
+
+
+### Features
+
+* **knn:** use distance-weighted voting in callback ([c63c62e](https://github.com/dimidagd/transformers-knn-adapter/commit/c63c62e438cd919da78444e2f1463f9d5500f331))
+* **pipeline:** add Gaussian directions plotting script ([6ff00d9](https://github.com/dimidagd/transformers-knn-adapter/commit/6ff00d9f4df60d989e8e0fee0c496486d3964dde))
+* **pipeline:** add plotting script and weighted KNN eval ([b6ffd98](https://github.com/dimidagd/transformers-knn-adapter/commit/b6ffd989745ee4a87b3b74d6115b60d99b1356c1))
+
+
+### Bug Fixes
+
+* **pipeline:** escape CLI help percent and lazy HFDataset train ([#23](https://github.com/dimidagd/transformers-knn-adapter/issues/23)) ([2e76bb0](https://github.com/dimidagd/transformers-knn-adapter/commit/2e76bb0f4dac746803e5e1c7d42ad40a98d7a937))
+
 ## [0.5.0](https://github.com/dimidagd/transformers-knn-adapter/compare/v0.4.0...v0.5.0) (2026-03-12)
 
 
