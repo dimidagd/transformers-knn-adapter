@@ -84,11 +84,11 @@ def test_dogfaces_smoke_with_local_dinov2_and_imagefolder(tmp_path: Path) -> Non
     assert summary["focal_loss_alpha"] == 0.25
     assert summary["focal_loss_gamma"] == 2.0
     assert "eval_knn_1/f1/macro" in summary["pretrain_eval_metrics"]
-    assert "eval_knn_1/recall_at_1" in summary["pretrain_eval_metrics"]
-    assert "eval_knn_1/mrr" in summary["pretrain_eval_metrics"]
+    assert "eval_knn_1/recall_at_1/macro" in summary["pretrain_eval_metrics"]
+    assert "eval_knn_1/mrr/macro" in summary["pretrain_eval_metrics"]
     assert "eval_knn_1/f1/macro" in summary["eval_metrics"]
-    assert "eval_knn_1/recall_at_1" in summary["eval_metrics"]
-    assert "eval_knn_1/mrr" in summary["eval_metrics"]
+    assert "eval_knn_1/recall_at_1/macro" in summary["eval_metrics"]
+    assert "eval_knn_1/mrr/macro" in summary["eval_metrics"]
     assert summary["feature_extraction_probe"]["status"] == "ok"
     assert summary["feature_extraction_probe"]["output_shape"] == [1, 197, 32]
     assert summary["custom_pipeline_probe"]["status"] == "ok"
@@ -143,8 +143,8 @@ def test_dogfaces_smoke_can_disable_knn_callback(tmp_path: Path) -> None:
     assert summary["knn_callback_enabled"] is False
     assert summary["use_focal_loss"] is False
     assert "eval_knn_1/f1/macro" not in summary["pretrain_eval_metrics"]
-    assert "eval_knn_1/recall_at_1" not in summary["pretrain_eval_metrics"]
-    assert "eval_knn_1/mrr" not in summary["pretrain_eval_metrics"]
+    assert "eval_knn_1/recall_at_1/macro" not in summary["pretrain_eval_metrics"]
+    assert "eval_knn_1/mrr/macro" not in summary["pretrain_eval_metrics"]
     assert "eval_knn_1/f1/macro" not in summary["eval_metrics"]
-    assert "eval_knn_1/recall_at_1" not in summary["eval_metrics"]
-    assert "eval_knn_1/mrr" not in summary["eval_metrics"]
+    assert "eval_knn_1/recall_at_1/macro" not in summary["eval_metrics"]
+    assert "eval_knn_1/mrr/macro" not in summary["eval_metrics"]
