@@ -36,7 +36,7 @@ class KNNCallback(TrainerCallback):
         label_column: str = "label",
         ks: Sequence[int] = (1, 5),
         batch_size: int | None = None,
-        embedding_source: str = "cls_mean",
+        embedding_source: str | None = None,
         average: str = "macro",
         zero_division: float | str = np.nan,
     ) -> None:
@@ -45,11 +45,30 @@ class KNNCallback(TrainerCallback):
         self.label_column = label_column
         self.ks = tuple(int(k) for k in ks)
         self.batch_size = batch_size
-        if embedding_source not in {"cls", "cls_mean"}:
+        if embedding_source is not None and embedding_source not in {"cls", "cls_mean"}:
             raise ValueError(f"Unsupported embedding_source {embedding_source!r}. Expected 'cls' or 'cls_mean'.")
         self.embedding_source = embedding_source
         self.average = average
         self.zero_division = zero_division
+
+    def _resolve_embedding_source(self, model: Any) -> str:
+        model_embedding_source = getattr(getattr(model, "config", None), "embedding_source", None)
+        if model_embedding_source is not None and model_embedding_source not in {"cls", "cls_mean"}:
+            raise ValueError(
+                f"Unsupported model.config.embedding_source {model_embedding_source!r}. "
+                "Expected 'cls' or 'cls_mean'."
+            )
+        callback_embedding_source = self.embedding_source
+        if callback_embedding_source is None:
+            return str(model_embedding_source or "cls_mean")
+        if model_embedding_source is not None and callback_embedding_source != model_embedding_source:
+            logger.warning(
+                "KNNCallback embedding_source=%s does not match model.config.embedding_source=%s. "
+                "KNN metrics will use the callback value.",
+                callback_embedding_source,
+                model_embedding_source,
+            )
+        return callback_embedding_source
 
     def _collate_batch(self, examples: list[dict[str, Any]]) -> tuple[torch.Tensor, torch.Tensor]:
         if any("pixel_values" not in example for example in examples):
@@ -123,6 +142,38 @@ class KNNCallback(TrainerCallback):
         mrr = float(reciprocal_ranks.mean())
         return recall_at_k, mrr
 
+    @classmethod
+    def _compute_averaged_retrieval_metrics_from_neighbor_labels(
+        cls,
+        neighbor_labels: np.ndarray,
+        true_labels: np.ndarray,
+        *,
+        average: str,
+    ) -> tuple[float, float]:
+        if average not in {"macro", "weighted"}:
+            return cls._compute_retrieval_metrics_from_neighbor_labels(neighbor_labels, true_labels)
+
+        per_class_recall_at_k: list[float] = []
+        per_class_mrr: list[float] = []
+        per_class_weights: list[float] = []
+        for class_label in np.unique(true_labels):
+            mask = true_labels == class_label
+            recall_at_k, mrr = cls._compute_retrieval_metrics_from_neighbor_labels(
+                neighbor_labels[mask],
+                true_labels[mask],
+            )
+            per_class_recall_at_k.append(recall_at_k)
+            per_class_mrr.append(mrr)
+            per_class_weights.append(float(mask.sum()))
+
+        if average == "macro":
+            return float(np.mean(per_class_recall_at_k)), float(np.mean(per_class_mrr))
+
+        return (
+            float(np.average(per_class_recall_at_k, weights=per_class_weights)),
+            float(np.average(per_class_mrr, weights=per_class_weights)),
+        )
+
     @staticmethod
     def _predict_from_neighbor_labels(neighbor_labels: np.ndarray, *, classes: np.ndarray) -> np.ndarray:
         class_to_index = {label: idx for idx, label in enumerate(classes.tolist())}
@@ -140,6 +191,7 @@ class KNNCallback(TrainerCallback):
         dataset: Any,
         batch_size: int,
         split_name: str,
+        embedding_source: str,
     ) -> tuple[np.ndarray, np.ndarray]:
         loader = self._build_loader(dataset, batch_size)
         device = next(model.parameters()).device
@@ -158,7 +210,7 @@ class KNNCallback(TrainerCallback):
             pixel_values = pixel_values.to(device)
             with torch.no_grad():
                 outputs = model(pixel_values=pixel_values, output_hidden_states=True)
-            embeddings = self._extract_embeddings(outputs, embedding_source=self.embedding_source)
+            embeddings = self._extract_embeddings(outputs, embedding_source=embedding_source)
             self._ensure_finite(f"{split_name} embeddings", embeddings)
             embeddings_batches.append(embeddings.detach().cpu().numpy())
             labels_batches.append(labels.numpy())
@@ -180,10 +232,11 @@ class KNNCallback(TrainerCallback):
             raise ValueError("KNNCallback requires trainer.model, train_dataset, and eval_dataset.")
 
         batch_size = self.batch_size or int(self.trainer.args.per_device_eval_batch_size)
+        embedding_source = self._resolve_embedding_source(model)
         logger.info(
             "Running KNN callback evaluation for ks=%s embedding_source=%s average=%s zero_division=%s batch_size=%d num_workers=%d",
             self.ks,
-            self.embedding_source,
+            embedding_source,
             self.average,
             self.zero_division,
             batch_size,
@@ -197,12 +250,14 @@ class KNNCallback(TrainerCallback):
                 dataset=train_dataset,
                 batch_size=batch_size,
                 split_name="train",
+                embedding_source=embedding_source,
             )
             eval_X, eval_y = self._collect_embeddings_and_labels(
                 model=model,
                 dataset=eval_dataset,
                 batch_size=batch_size,
                 split_name="eval",
+                embedding_source=embedding_source,
             )
         finally:
             if was_training:
@@ -220,7 +275,11 @@ class KNNCallback(TrainerCallback):
         for k in self.ks:
             neighbor_labels = all_neighbor_labels[:, :k]
             pred_y = self._predict_from_neighbor_labels(neighbor_labels, classes=classes)
-            recall_at_k, mrr = self._compute_retrieval_metrics_from_neighbor_labels(neighbor_labels, eval_y)
+            recall_at_k, mrr = self._compute_averaged_retrieval_metrics_from_neighbor_labels(
+                neighbor_labels,
+                eval_y,
+                average=self.average,
+            )
             precision, recall, f1, _ = precision_recall_fscore_support(
                 eval_y,
                 pred_y,
@@ -230,10 +289,10 @@ class KNNCallback(TrainerCallback):
             knn_metrics[f"eval_knn_{k}/f1/{self.average}"] = float(f1)
             knn_metrics[f"eval_knn_{k}/precision/{self.average}"] = float(precision)
             knn_metrics[f"eval_knn_{k}/recall/{self.average}"] = float(recall)
-            knn_metrics[f"eval_knn_{k}/recall_at_{k}"] = recall_at_k
-            knn_metrics[f"eval_knn_{k}/mrr"] = mrr
+            knn_metrics[f"eval_knn_{k}/recall_at_{k}/{self.average}"] = recall_at_k
+            knn_metrics[f"eval_knn_{k}/mrr/{self.average}"] = mrr
             logger.info(
-                "KNN metrics for k=%d: f1=%0.4f precision=%0.4f recall=%0.4f recall_at_%d=%0.4f mrr=%0.4f",
+                "KNN metrics for k=%d: f1=%0.4f precision=%0.4f recall=%0.4f recall_at_%d=%0.4f mrr=%0.4f average=%s",
                 k,
                 float(f1),
                 float(precision),
@@ -241,6 +300,7 @@ class KNNCallback(TrainerCallback):
                 k,
                 recall_at_k,
                 mrr,
+                self.average,
             )
         metrics.update(knn_metrics)
         self.trainer.log(knn_metrics)
