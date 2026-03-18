@@ -27,6 +27,7 @@ class Dinov2ForImageClassificationWithArcFaceLoss(Dinov2ForImageClassification):
         super().__init__(config)
         embedding_size = self.get_embedding_size_from_model_conf(config)
         self.classifier = nn.Identity()
+        self.embedding_source = self._resolve_embedding_source(config)
         self.arcface_margin = float(getattr(config, "arcface_margin", 28.6))
         self.arcface_scale = float(getattr(config, "arcface_scale", 64.0))
         self.use_focal_loss = bool(getattr(config, "use_focal_loss", False))
@@ -86,8 +87,18 @@ class Dinov2ForImageClassificationWithArcFaceLoss(Dinov2ForImageClassification):
         )
 
     @staticmethod
+    def _resolve_embedding_source(config: Any) -> str:
+        embedding_source = str(getattr(config, "embedding_source", "cls_mean"))
+        if embedding_source not in {"cls", "cls_mean"}:
+            raise ValueError("embedding_source must be one of: cls, cls_mean.")
+        return embedding_source
+
+    @staticmethod
     def get_embedding_size_from_model_conf(config: Any) -> int:
         hidden_size = int(getattr(config, "hidden_size"))
+        embedding_source = Dinov2ForImageClassificationWithArcFaceLoss._resolve_embedding_source(config)
+        if embedding_source == "cls":
+            return hidden_size
         return hidden_size * 2
 
     def _compute_classification_loss(self, logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
@@ -145,8 +156,15 @@ class Dinov2ForImageClassificationWithArcFaceLoss(Dinov2ForImageClassification):
         return self.arcface_loss.scale_logits(cosine, embeddings)
 
     @staticmethod
-    def calculate_embeddings(sequence_output: torch.Tensor) -> torch.Tensor:
+    def calculate_embeddings(
+        sequence_output: torch.Tensor,
+        embedding_source: str = "cls_mean",
+    ) -> torch.Tensor:
         cls_token = sequence_output[:, 0]
+        if embedding_source == "cls":
+            return cls_token
+        if embedding_source != "cls_mean":
+            raise ValueError("embedding_source must be one of: cls, cls_mean.")
         patch_tokens = sequence_output[:, 1:]
         if patch_tokens.shape[1] == 0:
             patch_mean = torch.zeros_like(cls_token)
@@ -155,7 +173,10 @@ class Dinov2ForImageClassificationWithArcFaceLoss(Dinov2ForImageClassification):
         return torch.cat([cls_token, patch_mean], dim=1)
 
     @staticmethod
-    def extract_embeddings_from_image_classifier_output(model_output: ImageClassifierOutput) -> torch.Tensor:
+    def extract_embeddings_from_image_classifier_output(
+        model_output: ImageClassifierOutput,
+        embedding_source: str = "cls_mean",
+    ) -> torch.Tensor:
         hidden_states = model_output.hidden_states
         if hidden_states is None or len(hidden_states) == 0:
             raise ValueError(
@@ -163,7 +184,10 @@ class Dinov2ForImageClassificationWithArcFaceLoss(Dinov2ForImageClassification):
                 "Call the model with output_hidden_states=True."
             )
         sequence_output = hidden_states[-1]
-        return Dinov2ForImageClassificationWithArcFaceLoss.calculate_embeddings(sequence_output)
+        return Dinov2ForImageClassificationWithArcFaceLoss.calculate_embeddings(
+            sequence_output,
+            embedding_source=embedding_source,
+        )
 
     def forward(
         self,
@@ -174,7 +198,7 @@ class Dinov2ForImageClassificationWithArcFaceLoss(Dinov2ForImageClassification):
         outputs = self.dinov2(pixel_values, **kwargs)
 
         sequence_output = outputs.last_hidden_state
-        embeddings = self.calculate_embeddings(sequence_output)
+        embeddings = self.calculate_embeddings(sequence_output, embedding_source=self.embedding_source)
 
         loss, _training_logits = self.compute_arcface_loss_and_logits(embeddings=embeddings, labels=labels)
         logits = self.compute_inference_logits(embeddings)
