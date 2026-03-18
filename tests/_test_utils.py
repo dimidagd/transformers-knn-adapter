@@ -62,6 +62,7 @@ def build_local_dinov2_checkpoint(root: Path) -> Path:
         mlp_ratio=2,
         intermediate_size=64,
     )
+    config.embedding_source = "cls_mean"
     model = Dinov2Model(config)
     model.save_pretrained(root)
     processor = BitImageProcessor(

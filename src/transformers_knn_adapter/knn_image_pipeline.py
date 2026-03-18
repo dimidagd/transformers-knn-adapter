@@ -50,7 +50,7 @@ class KNNImageClassificationPipeline(ImageClassificationPipeline):
         knn_model_path: str | Path,
         pad_to_square: bool = False,
         skip_channel_information: str | None = None,
-        embedding_source: str = "cls_mean",
+        embedding_source: str | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(*args, **kwargs)
@@ -167,6 +167,14 @@ class KNNImageClassificationPipeline(ImageClassificationPipeline):
             return self.pad_to_square
         return bool(pad_to_square)
 
+    def _resolve_default_embedding_source(self) -> str:
+        model_embedding_source = getattr(getattr(self.model, "config", None), "embedding_source", None)
+        if model_embedding_source is None:
+            return "cls_mean"
+        if model_embedding_source not in {"cls", "cls_mean"}:
+            raise ValueError("model.config.embedding_source must be one of: cls, cls_mean.")
+        return str(model_embedding_source)
+
     def _resolve_skip_channel_information(self, skip_channel_information: str | None) -> str | None:
         if skip_channel_information is None:
             return self.skip_channel_information
@@ -176,7 +184,7 @@ class KNNImageClassificationPipeline(ImageClassificationPipeline):
 
     def _resolve_embedding_source(self, embedding_source: str | None) -> str:
         if embedding_source is None:
-            embedding_source = self.embedding_source
+            embedding_source = getattr(self, "embedding_source", None) or self._resolve_default_embedding_source()
         if embedding_source not in {"cls", "cls_mean"}:
             raise ValueError("embedding_source must be one of: cls, cls_mean.")
         return embedding_source
@@ -1276,9 +1284,9 @@ def _resolve_cli_image_options(args: argparse.Namespace) -> tuple[bool, str | No
     return pad_to_square, skip_channel_information
 
 
-def _build_pipeline_from_args(args: argparse.Namespace) -> tuple[KNNImageClassificationPipeline, bool, str | None, str]:
+def _build_pipeline_from_args(args: argparse.Namespace) -> tuple[KNNImageClassificationPipeline, bool, str | None, str | None]:
     pad_to_square, skip_channel_information = _resolve_cli_image_options(args)
-    embedding_source = cast(str, getattr(args, "embedding_source", "cls_mean"))
+    embedding_source = cast(str | None, getattr(args, "embedding_source", None))
     clf = pipeline(
         "image-classification",
         model_path=args.model,
@@ -1478,8 +1486,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     train_parser.add_argument(
         "--embedding-source",
         choices=["cls", "cls_mean"],
-        default="cls_mean",
-        help="Embedding reduction used for KNN features: CLS only or CLS plus mean patch tokens.",
+        default=None,
+        help="Embedding reduction used for KNN features. Defaults to model.config.embedding_source or cls_mean.",
     )
     train_parser.add_argument("--device", type=int, default=-1, help="Transformers device index (-1 for CPU).")
     train_parser.add_argument(
@@ -1515,8 +1523,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     infer_parser.add_argument(
         "--embedding-source",
         choices=["cls", "cls_mean"],
-        default="cls_mean",
-        help="Embedding reduction used for KNN features: CLS only or CLS plus mean patch tokens.",
+        default=None,
+        help="Embedding reduction used for KNN features. Defaults to model.config.embedding_source or cls_mean.",
     )
     infer_parser.add_argument("--device", type=int, default=-1, help="Transformers device index (-1 for CPU).")
     infer_parser.add_argument(
@@ -1550,8 +1558,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     predict_parser.add_argument(
         "--embedding-source",
         choices=["cls", "cls_mean"],
-        default="cls_mean",
-        help="Embedding reduction used for KNN features: CLS only or CLS plus mean patch tokens.",
+        default=None,
+        help="Embedding reduction used for KNN features. Defaults to model.config.embedding_source or cls_mean.",
     )
     predict_parser.add_argument("--device", type=int, default=-1, help="Transformers device index (-1 for CPU).")
     predict_parser.add_argument(
@@ -1628,8 +1636,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     eval_parser.add_argument(
         "--embedding-source",
         choices=["cls", "cls_mean"],
-        default="cls_mean",
-        help="Embedding reduction used for KNN features: CLS only or CLS plus mean patch tokens.",
+        default=None,
+        help="Embedding reduction used for KNN features. Defaults to model.config.embedding_source or cls_mean.",
     )
     eval_parser.add_argument("--device", type=int, default=-1, help="Transformers device index (-1 for CPU).")
     eval_parser.add_argument(

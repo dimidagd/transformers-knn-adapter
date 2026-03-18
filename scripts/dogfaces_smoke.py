@@ -292,6 +292,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     config.focal_loss_alpha = args.focal_loss_alpha
     config.focal_loss_gamma = args.focal_loss_gamma
     config.freeze_schedule = load_freeze_schedule_config(args.freeze_schedule_config)
+    config.embedding_source = args.knn_embedding_source
 
     model = Dinov2ForImageClassificationWithArcFaceLoss.from_pretrained(
         args.model,
@@ -524,6 +525,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "use_focal_loss": config.use_focal_loss,
         "focal_loss_alpha": config.focal_loss_alpha,
         "focal_loss_gamma": config.focal_loss_gamma,
+        "model_embedding_source": config.embedding_source,
         "saved_model_class": type(model).__name__,
         "auto_model_reload_class": type(reloaded_backbone).__name__,
         "auto_model_export_dir": str(backbone_export_dir),

@@ -52,6 +52,7 @@ def _build_local_pipeline(
     top_k: int = 2,
     model_class: type[ViTModel] | type[ViTForImageClassification] = ViTModel,
     embedding_source: str = "cls_mean",
+    pipeline_embedding_source: str | None = None,
 ):
     """Create a local untrained tiny ViT/checkpoint + KNN pipeline (no network)."""
     model_dir = workdir / "tiny-local-vit"
@@ -67,6 +68,7 @@ def _build_local_pipeline(
         num_hidden_layers=2,
         num_attention_heads=4,
     )
+    config.embedding_source = embedding_source
     model = model_class(config)
     model.save_pretrained(model_dir)
 
@@ -84,7 +86,7 @@ def _build_local_pipeline(
         knn_model_path=str(knn_path),
         device=-1,
         top_k=top_k,
-        embedding_source=embedding_source,
+        embedding_source=pipeline_embedding_source,
     ), knn_path
 
 
@@ -538,6 +540,29 @@ def test_feature_extraction_embeddings_use_cls_plus_mean_patch_tokens(tmp_path: 
 
     assert single.tolist() == [1.0, 2.0, 5.0, 6.0]
     assert batch.tolist() == [[1.0, 2.0, 5.0, 6.0], [5.0, 6.0, 9.0, 10.0]]
+
+
+def test_pipeline_defaults_to_model_config_embedding_source(tmp_path: Path) -> None:
+    """Pipeline should default to model.config.embedding_source when CLI args omit it."""
+    clf, _ = _build_local_pipeline(
+        tmp_path,
+        model_class=ViTModel,
+        embedding_source="cls",
+        pipeline_embedding_source=None,
+    )
+    clf.feature_extraction_pipeline = lambda images, batch_size: [
+        [[1.0, 2.0], [3.0, 4.0], [7.0, 8.0]],
+        [[5.0, 6.0], [7.0, 8.0], [11.0, 12.0]],
+    ]
+
+    single = clf._extract_embedding_from_feature_output([[[1.0, 2.0], [3.0, 4.0], [7.0, 8.0]]])
+    batch = clf._extract_embeddings_from_images(
+        [Image.new("RGB", (32, 32), (0, 0, 0)), Image.new("RGB", (32, 32), (255, 255, 255))]
+    )
+
+    assert clf.embedding_source == "cls"
+    assert single.tolist() == [1.0, 2.0]
+    assert batch.tolist() == [[1.0, 2.0], [5.0, 6.0]]
 
 
 def test_feature_extraction_embeddings_use_cls_only_when_configured(tmp_path: Path) -> None:

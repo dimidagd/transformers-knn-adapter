@@ -29,6 +29,7 @@ dev = [
   "ruff",
   "pytest",
   "pytest-cov",
+  "accelerate",
 ]
 
 [tool.hatch.build.targets.wheel]

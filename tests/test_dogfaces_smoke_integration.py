@@ -83,6 +83,7 @@ def test_dogfaces_smoke_with_local_dinov2_and_imagefolder(tmp_path: Path) -> Non
     assert summary["use_focal_loss"] is False
     assert summary["focal_loss_alpha"] == 0.25
     assert summary["focal_loss_gamma"] == 2.0
+    assert summary["model_embedding_source"] == "cls_mean"
     assert "eval_knn_1/f1/macro" in summary["pretrain_eval_metrics"]
     assert "eval_knn_1/recall_at_1/macro" in summary["pretrain_eval_metrics"]
     assert "eval_knn_1/mrr/macro" in summary["pretrain_eval_metrics"]
