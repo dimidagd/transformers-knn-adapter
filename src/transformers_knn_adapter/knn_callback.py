@@ -175,13 +175,24 @@ class KNNCallback(TrainerCallback):
         )
 
     @staticmethod
-    def _predict_from_neighbor_labels(neighbor_labels: np.ndarray, *, classes: np.ndarray) -> np.ndarray:
+    def _predict_from_neighbor_labels(
+        neighbor_labels: np.ndarray,
+        neighbor_distances: np.ndarray,
+        *,
+        classes: np.ndarray,
+    ) -> np.ndarray:
         class_to_index = {label: idx for idx, label in enumerate(classes.tolist())}
         encoded = np.vectorize(class_to_index.__getitem__, otypes=[np.int64])(neighbor_labels)
         predictions = np.empty(encoded.shape[0], dtype=classes.dtype)
         for row_idx, row in enumerate(encoded):
-            counts = np.bincount(row, minlength=len(classes))
-            predictions[row_idx] = classes[int(np.argmax(counts))]
+            distances = neighbor_distances[row_idx]
+            if np.any(distances == 0.0):
+                weights = np.zeros_like(distances, dtype=np.float64)
+                weights[distances == 0.0] = 1.0
+            else:
+                weights = 1.0 / distances
+            class_weights = np.bincount(row, weights=weights, minlength=len(classes))
+            predictions[row_idx] = classes[int(np.argmax(class_weights))]
         return predictions
 
     def _collect_embeddings_and_labels(
@@ -266,15 +277,16 @@ class KNNCallback(TrainerCallback):
         knn_metrics: dict[str, float] = {}
         max_k = max(self.ks)
         logger.info("Fitting KNN classifier once with max_k=%d on %d train embeddings", max_k, len(train_y))
-        knn = KNeighborsClassifier(n_neighbors=max_k)
+        knn = KNeighborsClassifier(n_neighbors=max_k, weights="distance")
         knn.fit(train_X, train_y)
-        neighbor_indices = knn.kneighbors(eval_X, return_distance=False)
+        neighbor_distances, neighbor_indices = knn.kneighbors(eval_X, return_distance=True)
         all_neighbor_labels = train_y[neighbor_indices]
         classes = LabelEncoder().fit(train_y).classes_
 
         for k in self.ks:
             neighbor_labels = all_neighbor_labels[:, :k]
-            pred_y = self._predict_from_neighbor_labels(neighbor_labels, classes=classes)
+            distances = neighbor_distances[:, :k]
+            pred_y = self._predict_from_neighbor_labels(neighbor_labels, distances, classes=classes)
             recall_at_k, mrr = self._compute_averaged_retrieval_metrics_from_neighbor_labels(
                 neighbor_labels,
                 eval_y,

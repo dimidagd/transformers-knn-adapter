@@ -175,6 +175,20 @@ def test_knn_callback_retrieval_metrics_capture_rank_order() -> None:
     assert mrr == 0.75
 
 
+def test_knn_callback_predict_uses_distance_weighting() -> None:
+    neighbor_labels = torch.tensor([[0, 1]], dtype=torch.long).numpy()
+    neighbor_distances = torch.tensor([[2.0, 0.5]], dtype=torch.float32).numpy()
+    classes = torch.tensor([0, 1], dtype=torch.long).numpy()
+
+    predictions = KNNCallback._predict_from_neighbor_labels(
+        neighbor_labels,
+        neighbor_distances,
+        classes=classes,
+    )
+
+    assert predictions.tolist() == [1]
+
+
 def test_knn_callback_averaged_retrieval_metrics_balance_classes() -> None:
     neighbor_labels = torch.tensor(
         [
