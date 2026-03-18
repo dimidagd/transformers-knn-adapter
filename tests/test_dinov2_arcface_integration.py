@@ -15,6 +15,7 @@ import pytest
 import torch
 from transformers import AutoModel
 
+
 def compute_loss_and_logits(
     *,
     arcface_loss: torch.nn.Module,
