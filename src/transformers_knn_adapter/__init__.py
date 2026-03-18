@@ -1,19 +1,12 @@
 """Public package exports for transformers_knn_adapter."""
 
-from __future__ import annotations
+from .dinov2_arcface import Dinov2ForImageClassificationWithArcFaceLoss
+from .freeze_schedule_callback import FreezeScheduleCallback
+from .knn_image_pipeline import KNNImageClassificationPipeline, pipeline
 
-from typing import Any
-
-__all__ = ["KNNImageClassificationPipeline", "pipeline"]
-
-
-def __getattr__(name: str) -> Any:
-    if name in __all__:
-        from .knn_image_pipeline import KNNImageClassificationPipeline, pipeline
-
-        exports = {
-            "KNNImageClassificationPipeline": KNNImageClassificationPipeline,
-            "pipeline": pipeline,
-        }
-        return exports[name]
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+__all__ = [
+    "Dinov2ForImageClassificationWithArcFaceLoss",
+    "FreezeScheduleCallback",
+    "KNNImageClassificationPipeline",
+    "pipeline",
+]
