@@ -115,6 +115,13 @@ jobs:
       - name: Run pytest
         run: uv run pytest --cov=transformers_knn_adapter --cov-report=term-missing --cov-fail-under=60
 
+      - name: Run dogfaces smoke integration test
+        env:
+          RUN_DOGFACES_SMOKE_INTEGRATION: "1"
+        run: |
+          uv run --with accelerate --with pytorch-metric-learning \
+            pytest tests/test_dogfaces_smoke_integration.py -q
+
   build:
     runs-on: ubuntu-latest
     env:

@@ -24,13 +24,13 @@ from PIL import Image
 from transformers import ViTConfig, ViTForImageClassification, ViTImageProcessor, ViTModel
 
 import transformers_knn_adapter.knn_image_pipeline as knn_image_pipeline_module
+from tests._test_utils import EXPECTED_CLASSES, build_local_imagefolder_dataset, get_hf_dataset
 from transformers_knn_adapter.knn_image_pipeline import KNNImageClassificationPipeline, pipeline
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
-EXPECTED_CLASSES = ("class_a", "class_b", "class_c")
 SAMPLING_EXPECTED_CLASSES = {"class_a", "class_b", "class_c"}
 TRAIN_DEFAULTS = {
     "image_column": "image",
@@ -51,6 +51,7 @@ def _build_local_pipeline(
     workdir: Path,
     top_k: int = 2,
     model_class: type[ViTModel] | type[ViTForImageClassification] = ViTModel,
+    embedding_source: str = "cls_mean",
 ):
     """Create a local untrained tiny ViT/checkpoint + KNN pipeline (no network)."""
     model_dir = workdir / "tiny-local-vit"
@@ -83,6 +84,7 @@ def _build_local_pipeline(
         knn_model_path=str(knn_path),
         device=-1,
         top_k=top_k,
+        embedding_source=embedding_source,
     ), knn_path
 
 
@@ -124,44 +126,6 @@ def _run_training_case(
 def rng() -> np.random.Generator:
     """Provide deterministic RNG for synthetic test images."""
     return np.random.default_rng(1234)
-
-
-def get_hf_dataset(rng: np.random.Generator, num_samples: int = 100) -> tuple[Dataset, Image.Image]:
-    """Build a dummy HF Dataset and return it with one sample image."""
-    rows = []
-    for i in range(num_samples):
-        rows.append(
-            {
-                "image": Image.fromarray(rng.integers(0, 255, size=(32, 32, 3), dtype=np.uint8), mode="RGB"),
-                # Cycle labels to guarantee all classes are represented deterministically.
-                "label": i % len(EXPECTED_CLASSES),
-            }
-        )
-
-    features = Features(
-        {
-            "image": HFImage(),
-            "label": ClassLabel(names=list(EXPECTED_CLASSES)),
-        }
-    )
-    return Dataset.from_list(rows, features=features), rows[0]["image"]
-
-
-def _build_local_imagefolder_dataset(
-    root: Path,
-    rng: np.random.Generator,
-    *,
-    samples_per_class: int = 8,
-) -> Path:
-    """Create an on-disk imagefolder dataset with one subdirectory per class."""
-    root.mkdir(parents=True, exist_ok=True)
-    for class_name in EXPECTED_CLASSES:
-        class_dir = root / class_name
-        class_dir.mkdir(parents=True, exist_ok=True)
-        for idx in range(samples_per_class):
-            image = Image.fromarray(rng.integers(0, 255, size=(32, 32, 3), dtype=np.uint8), mode="RGB")
-            image.save(class_dir / f"{class_name}_{idx}.png")
-    return root
 
 
 def _build_ordered_dataset(
@@ -491,6 +455,43 @@ def test_train_streaming_iterable_dataset(
     _assert_knn_classes(case["clf"], set(EXPECTED_CLASSES))
 
 
+def test_train_stratified_requires_max_samples(
+    pipeline_factory,
+    rng: np.random.Generator,
+    model_class: type[ViTModel] | type[ViTForImageClassification],
+) -> None:
+    """Train should reject stratified mode when max_samples is not set."""
+    dataset, _ = get_hf_dataset(rng=rng)
+    clf, _ = pipeline_factory(model_class=model_class)
+    with pytest.raises(ValueError, match="stratified mode requires max_samples"):
+        clf.train(
+            dataset=dataset,
+            split="train",
+            image_column="image",
+            label_column="label",
+            batch_size=4,
+            n_neighbors=1,
+            stratified=True,
+            max_samples=None,
+        )
+
+
+def test_evaluate_stratified_requires_max_samples(trained_case: dict[str, object]) -> None:
+    """Evaluate should reject stratified mode when max_samples is not set."""
+    clf = trained_case["clf"]
+    dataset = trained_case["dataset"]
+    split = trained_case["split"] or "train"
+    with pytest.raises(ValueError, match="stratified mode requires max_samples"):
+        clf.evaluate(
+            dataset=dataset,
+            split=split,
+            image_column="image",
+            label_column="label",
+            stratified=True,
+            max_samples=None,
+        )
+
+
 def test_train_forwards_non_default_num_workers_to_feature_pipeline(
     tmp_path: Path,
     rng: np.random.Generator,
@@ -520,6 +521,44 @@ def test_train_forwards_non_default_num_workers_to_feature_pipeline(
     )
     assert seen["num_workers"] == 2
     assert seen["batch_size"] == 4
+
+
+def test_feature_extraction_embeddings_use_cls_plus_mean_patch_tokens(tmp_path: Path) -> None:
+    """Feature outputs should use CLS concatenated with the mean of patch tokens."""
+    clf, _ = _build_local_pipeline(tmp_path, model_class=ViTModel)
+    clf.feature_extraction_pipeline = lambda images, batch_size: [
+        [[1.0, 2.0], [3.0, 4.0], [7.0, 8.0]],
+        [[5.0, 6.0], [7.0, 8.0], [11.0, 12.0]],
+    ]
+
+    single = clf._extract_embedding_from_feature_output([[[1.0, 2.0], [3.0, 4.0], [7.0, 8.0]]])
+    batch = clf._extract_embeddings_from_images(
+        [Image.new("RGB", (32, 32), (0, 0, 0)), Image.new("RGB", (32, 32), (255, 255, 255))]
+    )
+
+    assert single.tolist() == [1.0, 2.0, 5.0, 6.0]
+    assert batch.tolist() == [[1.0, 2.0, 5.0, 6.0], [5.0, 6.0, 9.0, 10.0]]
+
+
+def test_feature_extraction_embeddings_use_cls_only_when_configured(tmp_path: Path) -> None:
+    """Feature outputs should use only the CLS token when embedding_source='cls'."""
+    clf, _ = _build_local_pipeline(tmp_path, model_class=ViTModel, embedding_source="cls")
+    clf.feature_extraction_pipeline = lambda images, batch_size: [
+        [[1.0, 2.0], [3.0, 4.0], [7.0, 8.0]],
+        [[5.0, 6.0], [7.0, 8.0], [11.0, 12.0]],
+    ]
+
+    single = clf._extract_embedding_from_feature_output(
+        [[[1.0, 2.0], [3.0, 4.0], [7.0, 8.0]]],
+        embedding_source="cls",
+    )
+    batch = clf._extract_embeddings_from_images(
+        [Image.new("RGB", (32, 32), (0, 0, 0)), Image.new("RGB", (32, 32), (255, 255, 255))],
+        embedding_source="cls",
+    )
+
+    assert single.tolist() == [1.0, 2.0]
+    assert batch.tolist() == [[1.0, 2.0], [5.0, 6.0]]
 
 
 def test_pad_image_to_square_returns_square_with_black_padding() -> None:
@@ -553,7 +592,7 @@ def test_train_and_evaluate_with_local_imagefolder_path(
 ) -> None:
     """Train/evaluate should support existing local imagefolder dataset paths."""
     clf, _ = _build_local_pipeline(tmp_path, model_class=ViTModel)
-    dataset_dir = _build_local_imagefolder_dataset(tmp_path / "imagefolder", rng=rng, samples_per_class=6)
+    dataset_dir = build_local_imagefolder_dataset(tmp_path / "imagefolder", rng=rng, samples_per_class=6)
 
     clf.train(
         dataset=str(dataset_dir),

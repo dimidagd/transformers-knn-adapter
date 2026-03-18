@@ -1,0 +1,14 @@
+{
+  "freeze_schedule": [
+    {
+      "epoch": 0.0,
+      "freeze_modules": ["dinov2"],
+      "unfreeze_modules": []
+    },
+    {
+      "epoch": 3.0,
+      "freeze_modules": [],
+      "unfreeze_modules": ["dinov2.encoder.layer.11"]
+    }
+  ]
+}

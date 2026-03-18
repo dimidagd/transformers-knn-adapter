@@ -50,12 +50,14 @@ class KNNImageClassificationPipeline(ImageClassificationPipeline):
         knn_model_path: str | Path,
         pad_to_square: bool = False,
         skip_channel_information: str | None = None,
+        embedding_source: str = "cls_mean",
         **kwargs: Any,
     ) -> None:
         super().__init__(*args, **kwargs)
         self.knn_model_path = str(knn_model_path)
         self.pad_to_square = pad_to_square
         self.skip_channel_information = skip_channel_information
+        self.embedding_source = self._resolve_embedding_source(embedding_source)
         feature_device = -1
         if isinstance(self.device, torch.device) and self.device.type == "cuda":
             feature_device = 0 if self.device.index is None else int(self.device.index)
@@ -172,14 +174,24 @@ class KNNImageClassificationPipeline(ImageClassificationPipeline):
             raise ValueError("skip_channel_information must be one of: R, G, B.")
         return skip_channel_information
 
+    def _resolve_embedding_source(self, embedding_source: str | None) -> str:
+        if embedding_source is None:
+            embedding_source = self.embedding_source
+        if embedding_source not in {"cls", "cls_mean"}:
+            raise ValueError("embedding_source must be one of: cls, cls_mean.")
+        return embedding_source
+
     def _sanitize_parameters(self, **kwargs: Any) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
         custom_pad = kwargs.pop("pad_to_square", None)
         custom_skip_channel = kwargs.pop("skip_channel_information", None)
+        custom_embedding_source = kwargs.pop("embedding_source", None)
         preprocess_params, forward_params, postprocess_params = super()._sanitize_parameters(**kwargs)
         if custom_pad is not None:
             preprocess_params["pad_to_square"] = bool(custom_pad)
         if custom_skip_channel is not None:
             preprocess_params["skip_channel_information"] = str(custom_skip_channel)
+        if custom_embedding_source is not None:
+            forward_params["embedding_source"] = str(custom_embedding_source)
         return preprocess_params, forward_params, postprocess_params
 
     def preprocess(self, image: Any, **preprocess_params: Any) -> dict[str, Any]:
@@ -448,12 +460,25 @@ class KNNImageClassificationPipeline(ImageClassificationPipeline):
             )
         return dataset_obj
 
-    def _extract_cls_embedding_from_feature_output(self, feature_output: Any) -> np.ndarray:
+    def _extract_embedding_from_feature_output(
+        self,
+        feature_output: Any,
+        *,
+        embedding_source: str | None = None,
+    ) -> np.ndarray:
+        resolved_embedding_source = self._resolve_embedding_source(embedding_source)
         features_np = np.asarray(feature_output, dtype=np.float32)
         while features_np.ndim > 2 and features_np.shape[0] == 1:
             features_np = features_np[0]
         if features_np.ndim == 2:
-            return features_np[0]
+            cls_token = features_np[0].astype(np.float32, copy=False)
+            if resolved_embedding_source == "cls":
+                return cls_token
+            if features_np.shape[0] == 1:
+                vision_mean = np.zeros_like(cls_token)
+            else:
+                vision_mean = features_np[1:].mean(axis=0)
+            return np.concatenate([cls_token, vision_mean], axis=0)
         if features_np.ndim == 1:
             return features_np
         raise ValueError(f"Unexpected feature output shape: {features_np.shape}")
@@ -474,38 +499,30 @@ class KNNImageClassificationPipeline(ImageClassificationPipeline):
             saved += 1
         return saved
 
-    def _map_dataset_images_for_training(
+    def _extract_embeddings_from_images(
         self,
+        images: list[Image.Image],
         *,
-        dataset_obj: HFDataset,
-        image_column: str,
-        pad_to_square: bool,
-        skip_channel_information: str | None,
-        num_workers: int,
-    ) -> HFDataset:
-        def _transform_row(row: dict[str, Any]) -> dict[str, Any]:
-            image = KNNImageClassificationPipeline._prepare_image_static(
-                row[image_column],
-                pad_to_square=pad_to_square,
-                skip_channel_information=skip_channel_information,
-            )
-            return {image_column: image}
-
-        num_proc = num_workers if num_workers > 1 else None
-        return dataset_obj.map(_transform_row, desc="Applying image transforms", num_proc=num_proc)
-
-    def _extract_embeddings_from_images(self, images: list[Image.Image]) -> np.ndarray:
+        embedding_source: str | None = None,
+    ) -> np.ndarray:
+        resolved_embedding_source = self._resolve_embedding_source(embedding_source)
         raw_features = self.feature_extraction_pipeline(images, batch_size=len(images))
         features_np = np.asarray(raw_features, dtype=np.float32)
         # Some HF backends return an extra singleton axis: (B, 1, T, D).
         if features_np.ndim == 4 and features_np.shape[1] == 1:
             features_np = features_np[:, 0, :, :]
         if features_np.ndim == 3:
-            # Keep CLS-token embedding for consistency with existing behavior.
-            return features_np[:, 0, :]
+            cls_tokens = features_np[:, 0, :]
+            if resolved_embedding_source == "cls":
+                return cls_tokens
+            if features_np.shape[1] == 1:
+                vision_means = np.zeros_like(cls_tokens)
+            else:
+                vision_means = features_np[:, 1:, :].mean(axis=1)
+            return np.concatenate([cls_tokens, vision_means], axis=1)
         if features_np.ndim == 2:
             if len(images) == 1:
-                return features_np[0:1, :]
+                return features_np
             return features_np
         raise ValueError(
             "Expected 2D/3D features (or 4D with singleton axis) from extraction pipeline, "
@@ -526,14 +543,16 @@ class KNNImageClassificationPipeline(ImageClassificationPipeline):
         skip_channel_information: str | None,
         debug_save_transformed_samples_dir: str | Path | None = None,
         debug_save_transformed_samples_count: int = 0,
+        embedding_source: str = "cls_mean",
     ) -> tuple[np.ndarray, np.ndarray, np.memmap | None, str | None, int]:
         """Extract embeddings and labels, optionally using memmap storage for known sample counts."""
         self.model.eval()
+        resolved_embedding_source = self._resolve_embedding_source(embedding_source)
         embedding_batches: list[np.ndarray] = []
         embeddings_mm: np.memmap | None = None
         memmap_path: str | None = None
         write_idx = 0
-        labels: list[Any]
+        labels: list[Any] = []
         loaded = 0
         if isinstance(dataset_obj, HFDataset):
             if max_samples is not None:
@@ -541,37 +560,52 @@ class KNNImageClassificationPipeline(ImageClassificationPipeline):
             labels = [
                 self._normalize_label(raw_label, label_names) for raw_label in cast(list[Any], dataset_obj[label_column])
             ]
-            total_samples: int | None = len(labels)
-            transformed_dataset = self._map_dataset_images_for_training(
-                dataset_obj=dataset_obj,
-                image_column=image_column,
-                pad_to_square=pad_to_square,
-                skip_channel_information=skip_channel_information,
-                num_workers=num_workers,
-            )
+            total_samples: int | None = len(dataset_obj)
+
+            def _transform_row(row: dict[str, Any]) -> dict[str, Any]:
+                image_value = row[image_column]
+                if isinstance(image_value, list):
+                    transformed_images = [
+                        self._prepare_image(
+                            img,
+                            pad_to_square=pad_to_square,
+                            skip_channel_information=skip_channel_information,
+                        )
+                        for img in image_value
+                    ]
+                    row[image_column] = transformed_images
+                    return row
+                row[image_column] = self._prepare_image(
+                    image_value,
+                    pad_to_square=pad_to_square,
+                    skip_channel_information=skip_channel_information,
+                )
+                return row
+
+            transformed_dataset = dataset_obj.with_transform(_transform_row)
             if debug_save_transformed_samples_dir is not None and debug_save_transformed_samples_count > 0:
                 sample_count = min(debug_save_transformed_samples_count, len(transformed_dataset))
-                sample_images = cast(list[Any], transformed_dataset[image_column][:sample_count])
+                transformed_images = [transformed_dataset[idx][image_column] for idx in range(sample_count)]
                 saved = self._save_debug_transformed_samples(
-                    images=sample_images,
+                    images=transformed_images,
                     output_dir=debug_save_transformed_samples_dir,
                     prefix="train",
                 )
                 logger.info("Saved %d transformed train debug samples to %s", saved, debug_save_transformed_samples_dir)
-            raw_images: Any = KeyDataset(transformed_dataset, image_column)
             feature_iter = self.feature_extraction_pipeline(
-                raw_images,
+                KeyDataset(transformed_dataset, image_column),
                 batch_size=batch_size,
                 num_workers=num_workers,
             )
         else:
-            labels = []
             dataset_for_iter = dataset_obj.take(max_samples) if max_samples is not None else dataset_obj
             total_samples = max_samples
-            debug_saved = 0
+            if debug_save_transformed_samples_dir is not None and debug_save_transformed_samples_count > 0:
+                logger.warning(
+                    "debug_save_transformed_samples_* for train is currently supported only for non-streaming HFDataset."
+                )
 
             def image_iter() -> Any:
-                nonlocal debug_saved
                 for row in dataset_for_iter:
                     labels.append(self._normalize_label(row[label_column], label_names))
                     image = self._prepare_image(
@@ -579,17 +613,6 @@ class KNNImageClassificationPipeline(ImageClassificationPipeline):
                         pad_to_square=pad_to_square,
                         skip_channel_information=skip_channel_information,
                     )
-                    if (
-                        debug_save_transformed_samples_dir is not None
-                        and debug_save_transformed_samples_count > 0
-                        and debug_saved < debug_save_transformed_samples_count
-                    ):
-                        self._save_debug_transformed_samples(
-                            images=[image],
-                            output_dir=debug_save_transformed_samples_dir,
-                            prefix=f"train_{debug_saved:03d}",
-                        )
-                        debug_saved += 1
                     yield image
 
             feature_iter = self.feature_extraction_pipeline(
@@ -599,7 +622,10 @@ class KNNImageClassificationPipeline(ImageClassificationPipeline):
             )
 
         for feature_output in tqdm(feature_iter, total=total_samples, desc="Extracting train embeddings"):
-            embedding = self._extract_cls_embedding_from_feature_output(feature_output).reshape(1, -1)
+            embedding = self._extract_embedding_from_feature_output(
+                feature_output,
+                embedding_source=resolved_embedding_source,
+            ).reshape(1, -1)
             loaded += 1
             if total_samples is not None:
                 if embeddings_mm is None:
@@ -762,6 +788,7 @@ class KNNImageClassificationPipeline(ImageClassificationPipeline):
         grid_search_scoring: str | None = None,
         pad_to_square: bool | None = None,
         skip_channel_information: str | None = None,
+        embedding_source: str | None = None,
         debug_save_transformed_samples_dir: str | Path | None = None,
         debug_save_transformed_samples_count: int = 0,
         save_knn_model_path: str | Path | None = None,
@@ -801,10 +828,13 @@ class KNNImageClassificationPipeline(ImageClassificationPipeline):
             raise ValueError("grid_search_scoring can only be set when grid_search=True.")
         if streaming and stratified:
             raise ValueError("stratified mode is only supported when streaming=False.")
+        if stratified and max_samples is None:
+            raise ValueError("stratified mode requires max_samples to be set.")
         if streaming and pre_shuffle:
             raise ValueError("pre_shuffle is only supported when streaming=False.")
         resolved_pad_to_square = self._resolve_pad_to_square(pad_to_square)
         resolved_skip_channel_information = self._resolve_skip_channel_information(skip_channel_information)
+        resolved_embedding_source = self._resolve_embedding_source(embedding_source)
 
         logger.info(
             "Starting KNN training: split=%s image_column=%s label_column=%s batch_size=%d n_neighbors=%d streaming=%s stratified=%s pre_shuffle=%s shuffle=%s shuffle_seed=%d max_samples=%s",
@@ -831,12 +861,12 @@ class KNNImageClassificationPipeline(ImageClassificationPipeline):
         if stratified:
             if not isinstance(dataset_obj, HFDataset):
                 raise ValueError("stratified mode requires a non-streaming Hugging Face Dataset.")
-            if max_samples is not None:
-                dataset_obj = dataset_obj.train_test_split(
-                    train_size=max_samples,
-                    stratify_by_column=label_column,
-                    seed=shuffle_seed,
-                )["train"]
+            dataset_obj = dataset_obj.train_test_split(
+                train_size=max_samples,
+                stratify_by_column=label_column,
+                seed=shuffle_seed,
+            )["train"]
+            max_samples = None
             logger.info("Applied stratified sampling for training subset")
             
         if shuffle:
@@ -862,6 +892,7 @@ class KNNImageClassificationPipeline(ImageClassificationPipeline):
             skip_channel_information=resolved_skip_channel_information,
             debug_save_transformed_samples_dir=debug_save_transformed_samples_dir,
             debug_save_transformed_samples_count=debug_save_transformed_samples_count,
+            embedding_source=resolved_embedding_source,
         )
 
         try:
@@ -918,6 +949,7 @@ class KNNImageClassificationPipeline(ImageClassificationPipeline):
         positive_classes_population_ratio: float | None = None,
         pad_to_square: bool | None = None,
         skip_channel_information: str | None = None,
+        embedding_source: str | None = None,
         debug_save_transformed_samples_dir: str | Path | None = None,
         debug_save_transformed_samples_count: int = 0,
         reid_cmc_ranks: tuple[int, ...] = (1, 5, 10),
@@ -945,6 +977,8 @@ class KNNImageClassificationPipeline(ImageClassificationPipeline):
             raise ValueError("positive_classes_population_ratio must be in [0.0, 1.0]")
         if streaming and stratified:
             raise ValueError("stratified mode is only supported when streaming=False.")
+        if stratified and max_samples is None:
+            raise ValueError("stratified mode requires max_samples to be set.")
         if streaming and pre_shuffle:
             raise ValueError("pre_shuffle is only supported when streaming=False.")
         if streaming and (min_class_instances is not None or positive_classes_population_ratio is not None):
@@ -954,6 +988,7 @@ class KNNImageClassificationPipeline(ImageClassificationPipeline):
             )
         resolved_pad_to_square = self._resolve_pad_to_square(pad_to_square)
         resolved_skip_channel_information = self._resolve_skip_channel_information(skip_channel_information)
+        resolved_embedding_source = self._resolve_embedding_source(embedding_source)
         dataset_obj = self._resolve_dataset(
             dataset=dataset,
             split=split,
@@ -964,13 +999,12 @@ class KNNImageClassificationPipeline(ImageClassificationPipeline):
         if stratified:
             if not isinstance(dataset_obj, HFDataset):
                 raise ValueError("stratified mode requires a non-streaming Hugging Face Dataset.")
-            if max_samples is not None:
-                dataset_obj = dataset_obj.train_test_split(
-                    train_size=max_samples,
-                    stratify_by_column=label_column,
-                    seed=shuffle_seed,
-                )["train"]
-                max_samples = None
+            dataset_obj = dataset_obj.train_test_split(
+                train_size=max_samples,
+                stratify_by_column=label_column,
+                seed=shuffle_seed,
+            )["train"]
+            max_samples = None
         if shuffle:
             if isinstance(dataset_obj, IterableDataset):
                 dataset_obj = dataset_obj.shuffle(seed=shuffle_seed, buffer_size=shuffle_buffer_size)
@@ -1072,6 +1106,7 @@ class KNNImageClassificationPipeline(ImageClassificationPipeline):
                 top_k=eval_top_k,
                 pad_to_square=resolved_pad_to_square,
                 skip_channel_information=resolved_skip_channel_information,
+                embedding_source=resolved_embedding_source,
             )
             total = max_samples
             for idx, pred in enumerate(tqdm(pred_iter, total=total, desc="Evaluating")):
@@ -1115,29 +1150,41 @@ class KNNImageClassificationPipeline(ImageClassificationPipeline):
         logger.info("Classification report:\n%s", report_text)
         return metrics
 
-    def _extract_embeddings(self, model_outputs: Any) -> torch.Tensor:
+    def _extract_embeddings(self, model_outputs: Any, *, embedding_source: str | None = None) -> torch.Tensor:
         """Extract a 2D embedding tensor from transformer model outputs."""
+        resolved_embedding_source = self._resolve_embedding_source(embedding_source)
         if getattr(model_outputs, "last_hidden_state", None) is not None:
-            embeddings = cast(torch.Tensor, model_outputs.last_hidden_state[:, 0, :])
-        elif getattr(model_outputs, "pooler_output", None) is not None:
+            sequence_output = cast(torch.Tensor, model_outputs.last_hidden_state)
+            cls_token = sequence_output[:, 0, :]
+            if resolved_embedding_source == "cls":
+                embeddings = cls_token
+            else:
+                patch_tokens = sequence_output[:, 1:, :]
+                if patch_tokens.shape[1] == 0:
+                    patch_mean = torch.zeros_like(cls_token)
+                else:
+                    patch_mean = patch_tokens.mean(dim=1)
+                embeddings = torch.cat([cls_token, patch_mean], dim=1)
+        elif getattr(model_outputs, "pooler_output", None) is not None and resolved_embedding_source == "cls":
             embeddings = cast(torch.Tensor, model_outputs.pooler_output)
         else:
-            raise ValueError("Model outputs do not contain pooler_output or last_hidden_state.")
+            raise ValueError("Model outputs do not contain hidden states suitable for embedding extraction.")
         embeddings = embeddings.flatten(start_dim=1)
         if embeddings.ndim != 2:
             raise ValueError(f"Expected 2D embeddings, got shape {tuple(embeddings.shape)}")
         return embeddings
 
     def _forward(self, model_inputs: dict[str, Any], **forward_params: Any) -> Any:
-        del forward_params
         if self.knn_model is None:
             raise ValueError("KNN head is not loaded. Provide knn_model_path or call train(...) first.")
+        resolved_embedding_source = self._resolve_embedding_source(forward_params.pop("embedding_source", None))
+        del forward_params
         prepared_images = model_inputs["prepared_image"]
         if isinstance(prepared_images, list):
             images = cast(list[Image.Image], prepared_images)
         else:
             images = [cast(Image.Image, prepared_images)]
-        embeddings_np = self._extract_embeddings_from_images(images)
+        embeddings_np = self._extract_embeddings_from_images(images, embedding_source=resolved_embedding_source)
         probs_np = self.knn_model.predict_proba(embeddings_np)
         probs = torch.from_numpy(np.asarray(probs_np, dtype=np.float32))
         return {"probs": probs}
@@ -1229,8 +1276,9 @@ def _resolve_cli_image_options(args: argparse.Namespace) -> tuple[bool, str | No
     return pad_to_square, skip_channel_information
 
 
-def _build_pipeline_from_args(args: argparse.Namespace) -> tuple[KNNImageClassificationPipeline, bool, str | None]:
+def _build_pipeline_from_args(args: argparse.Namespace) -> tuple[KNNImageClassificationPipeline, bool, str | None, str]:
     pad_to_square, skip_channel_information = _resolve_cli_image_options(args)
+    embedding_source = cast(str, getattr(args, "embedding_source", "cls_mean"))
     clf = pipeline(
         "image-classification",
         model_path=args.model,
@@ -1239,14 +1287,15 @@ def _build_pipeline_from_args(args: argparse.Namespace) -> tuple[KNNImageClassif
         top_k=args.top_k,
         pad_to_square=pad_to_square,
         skip_channel_information=skip_channel_information,
+        embedding_source=embedding_source,
     )
-    return clf, pad_to_square, skip_channel_information
+    return clf, pad_to_square, skip_channel_information, embedding_source
 
 
 def _train_pipeline_from_args(args: argparse.Namespace) -> KNNImageClassificationPipeline:
     """Build and train a pipeline instance from parsed CLI arguments."""
     _validate_cli_train_args(args)
-    clf, pad_to_square, skip_channel_information = _build_pipeline_from_args(args)
+    clf, pad_to_square, skip_channel_information, embedding_source = _build_pipeline_from_args(args)
 
     logger.info(
         "CLI train using dataset=%s split=%s image_column=%s label_column=%s",
@@ -1276,6 +1325,7 @@ def _train_pipeline_from_args(args: argparse.Namespace) -> KNNImageClassificatio
         grid_search_scoring=args.grid_search_scoring,
         pad_to_square=pad_to_square,
         skip_channel_information=skip_channel_information,
+        embedding_source=embedding_source,
         debug_save_transformed_samples_dir=args.debug_save_transformed_samples_dir,
         debug_save_transformed_samples_count=args.debug_save_transformed_samples_count,
         save_knn_model_path=args.knn_model_path,
@@ -1294,11 +1344,21 @@ def _run_cli_infer(args: argparse.Namespace) -> None:
     """Handle the `infer` CLI command using an already-trained KNN model."""
     if args.inference_batch_size <= 0:
         raise ValueError("--inference-batch-size must be > 0.")
-    clf, pad_to_square, skip_channel_information = _build_pipeline_from_args(args)
+    clf, pad_to_square, skip_channel_information, embedding_source = _build_pipeline_from_args(args)
     image_input = args.image
     image_batch = [image_input for _ in range(args.inference_batch_size)]
-    single_result = clf(image_input, pad_to_square=pad_to_square, skip_channel_information=skip_channel_information)
-    batch_result = clf(image_batch, pad_to_square=pad_to_square, skip_channel_information=skip_channel_information)
+    single_result = clf(
+        image_input,
+        pad_to_square=pad_to_square,
+        skip_channel_information=skip_channel_information,
+        embedding_source=embedding_source,
+    )
+    batch_result = clf(
+        image_batch,
+        pad_to_square=pad_to_square,
+        skip_channel_information=skip_channel_information,
+        embedding_source=embedding_source,
+    )
     logger.info("Single-image inference input: %s", image_input)
     logger.info("Single-image inference result: %s", single_result)
     logger.info("Batch inference URLs (count=%d): %s", args.inference_batch_size, image_batch)
@@ -1307,14 +1367,19 @@ def _run_cli_infer(args: argparse.Namespace) -> None:
 
 def _run_cli_predict(args: argparse.Namespace) -> None:
     """Handle the `predict` CLI command."""
-    clf, pad_to_square, skip_channel_information = _build_pipeline_from_args(args)
-    result = clf(args.image, pad_to_square=pad_to_square, skip_channel_information=skip_channel_information)
+    clf, pad_to_square, skip_channel_information, embedding_source = _build_pipeline_from_args(args)
+    result = clf(
+        args.image,
+        pad_to_square=pad_to_square,
+        skip_channel_information=skip_channel_information,
+        embedding_source=embedding_source,
+    )
     logger.info("Prediction result: %s", result)
 
 
 def _run_cli_eval(args: argparse.Namespace) -> None:
     """Handle the `eval` CLI command."""
-    clf, pad_to_square, skip_channel_information = _build_pipeline_from_args(args)
+    clf, pad_to_square, skip_channel_information, embedding_source = _build_pipeline_from_args(args)
     metrics = clf.evaluate(
         dataset=args.dataset,
         split=args.split,
@@ -1334,6 +1399,7 @@ def _run_cli_eval(args: argparse.Namespace) -> None:
         positive_classes_population_ratio=args.positive_classes_population_ratio,
         pad_to_square=pad_to_square,
         skip_channel_information=skip_channel_information,
+        embedding_source=embedding_source,
         debug_save_transformed_samples_dir=args.debug_save_transformed_samples_dir,
         debug_save_transformed_samples_count=args.debug_save_transformed_samples_count,
         reid_cmc_ranks=tuple(args.reid_cmc_ranks),
@@ -1372,7 +1438,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "Shuffle base split deterministically before applying split-slice expressions "
-            "(example: train[80%:]). Uses --shuffle-seed."
+            "(example: train[80%%:]). Uses --shuffle-seed."
         ),
     )
     train_parser.add_argument("--shuffle-seed", type=int, default=42, help="Shuffle seed.")
@@ -1409,6 +1475,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="GridSearchCV scoring metric (required with --grid-search).",
     )
     train_parser.add_argument("--top-k", type=int, default=2, help="Top-k at inference time.")
+    train_parser.add_argument(
+        "--embedding-source",
+        choices=["cls", "cls_mean"],
+        default="cls_mean",
+        help="Embedding reduction used for KNN features: CLS only or CLS plus mean patch tokens.",
+    )
     train_parser.add_argument("--device", type=int, default=-1, help="Transformers device index (-1 for CPU).")
     train_parser.add_argument(
         "--pad-to-square",
@@ -1440,6 +1512,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     infer_parser.add_argument("--model", required=True, help="HF model id/path for feature extraction.")
     infer_parser.add_argument("--knn-model-path", required=True, help="Path to save/load KNN model (.joblib).")
     infer_parser.add_argument("--top-k", type=int, default=3, help="Top-k predictions.")
+    infer_parser.add_argument(
+        "--embedding-source",
+        choices=["cls", "cls_mean"],
+        default="cls_mean",
+        help="Embedding reduction used for KNN features: CLS only or CLS plus mean patch tokens.",
+    )
     infer_parser.add_argument("--device", type=int, default=-1, help="Transformers device index (-1 for CPU).")
     infer_parser.add_argument(
         "--pad-to-square",
@@ -1469,6 +1547,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     predict_parser.add_argument("--knn-model-path", required=True, help="Path to trained KNN model (.joblib).")
     predict_parser.add_argument("--image", required=True, help="Image path/URL accepted by transformers image pipeline.")
     predict_parser.add_argument("--top-k", type=int, default=3, help="Top-k predictions.")
+    predict_parser.add_argument(
+        "--embedding-source",
+        choices=["cls", "cls_mean"],
+        default="cls_mean",
+        help="Embedding reduction used for KNN features: CLS only or CLS plus mean patch tokens.",
+    )
     predict_parser.add_argument("--device", type=int, default=-1, help="Transformers device index (-1 for CPU).")
     predict_parser.add_argument(
         "--pad-to-square",
@@ -1508,7 +1592,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "Shuffle base split deterministically before applying split-slice expressions "
-            "(example: train[80%:]). Uses --shuffle-seed."
+            "(example: train[80%%:]). Uses --shuffle-seed."
         ),
     )
     eval_parser.add_argument("--shuffle-seed", type=int, default=42, help="Shuffle seed.")
@@ -1541,6 +1625,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     eval_parser.add_argument("--top-k", type=int, default=1, help="Top-k predictions (evaluation uses top-1).")
+    eval_parser.add_argument(
+        "--embedding-source",
+        choices=["cls", "cls_mean"],
+        default="cls_mean",
+        help="Embedding reduction used for KNN features: CLS only or CLS plus mean patch tokens.",
+    )
     eval_parser.add_argument("--device", type=int, default=-1, help="Transformers device index (-1 for CPU).")
     eval_parser.add_argument(
         "--pad-to-square",
