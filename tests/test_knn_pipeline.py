@@ -18,13 +18,28 @@ from typing import Any
 
 import numpy as np
 import pytest
+import torch
 from datasets import ClassLabel, Dataset, Features
 from datasets import Image as HFImage
 from PIL import Image
-from transformers import ViTConfig, ViTForImageClassification, ViTImageProcessor, ViTModel
+from torch.utils.data import Dataset as TorchDataset
+from transformers import (
+    AutoImageProcessor,
+    Dinov2Model,
+    ViTConfig,
+    ViTForImageClassification,
+    ViTImageProcessor,
+    ViTModel,
+)
 
 import transformers_knn_adapter.knn_image_pipeline as knn_image_pipeline_module
-from tests._test_utils import EXPECTED_CLASSES, build_local_imagefolder_dataset, get_hf_dataset
+from tests._test_utils import (
+    EXPECTED_CLASSES,
+    build_local_dinov2_checkpoint,
+    build_local_imagefolder_dataset,
+    get_hf_dataset,
+)
+from transformers_knn_adapter.knn_callback import KNNCallback
 from transformers_knn_adapter.knn_image_pipeline import KNNImageClassificationPipeline, pipeline
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -51,7 +66,6 @@ def _build_local_pipeline(
     workdir: Path,
     top_k: int = 2,
     model_class: type[ViTModel] | type[ViTForImageClassification] = ViTModel,
-    embedding_source: str = "cls_mean",
 ):
     """Create a local untrained tiny ViT/checkpoint + KNN pipeline (no network)."""
     model_dir = workdir / "tiny-local-vit"
@@ -84,7 +98,6 @@ def _build_local_pipeline(
         knn_model_path=str(knn_path),
         device=-1,
         top_k=top_k,
-        embedding_source=embedding_source,
     ), knn_path
 
 
@@ -523,42 +536,158 @@ def test_train_forwards_non_default_num_workers_to_feature_pipeline(
     assert seen["batch_size"] == 4
 
 
-def test_feature_extraction_embeddings_use_cls_plus_mean_patch_tokens(tmp_path: Path) -> None:
-    """Feature outputs should use CLS concatenated with the mean of patch tokens."""
+def test_dinov2_pipeline_features_match_direct_pooler_output(
+    tmp_path: Path,
+    rng: np.random.Generator,
+) -> None:
+    """Nested image-feature-extraction output should match direct Dinov2 pooler_output."""
+    model_dir = build_local_dinov2_checkpoint(tmp_path / "tiny-local-dinov2")
+    clf, _ = pipeline(
+        "image-classification",
+        model_path=str(model_dir),
+        knn_model_path=str(tmp_path / "knn_head.joblib"),
+        device=-1,
+        top_k=2,
+    ), tmp_path / "knn_head.joblib"
+    direct_model = Dinov2Model.from_pretrained(model_dir)
+    processor = AutoImageProcessor.from_pretrained(model_dir)
+    raw_images = [get_hf_dataset(rng=rng, num_samples=2)[0][idx]["image"] for idx in range(2)]
+    prepared_images = [
+        clf._prepare_image(image, pad_to_square=False, skip_channel_information=None)
+        for image in raw_images
+    ]
+
+    pipeline_features = clf._extract_embeddings_from_images(prepared_images, num_workers=0)
+    inputs = processor(images=prepared_images, return_tensors="pt")
+    with torch.no_grad():
+        outputs = direct_model(**inputs)
+    direct_features = outputs.pooler_output.cpu().numpy()
+
+    assert pipeline_features.shape == direct_features.shape
+    assert np.allclose(pipeline_features, direct_features)
+
+
+def test_knn_tree_features_match_runtime_pipeline_features(
+    tmp_path: Path,
+    rng: np.random.Generator,
+) -> None:
+    """Training-time KNN features should match runtime pipeline features for the same samples."""
+    dataset, _ = get_hf_dataset(rng=rng, num_samples=9)
     clf, _ = _build_local_pipeline(tmp_path, model_class=ViTModel)
-    clf.feature_extraction_pipeline = lambda images, batch_size: [
-        [[1.0, 2.0], [3.0, 4.0], [7.0, 8.0]],
-        [[5.0, 6.0], [7.0, 8.0], [11.0, 12.0]],
+    captured: dict[str, np.ndarray] = {}
+    original_fit = clf._fit_knn_from_features
+
+    def capture_fit_features(**kwargs: Any):
+        captured["features"] = np.array(kwargs["features"], copy=True)
+        captured["labels"] = np.array(kwargs["y"], copy=True)
+        return original_fit(**kwargs)
+
+    clf._fit_knn_from_features = capture_fit_features  # type: ignore[method-assign]
+    clf.train(
+        dataset=dataset,
+        split="train",
+        image_column="image",
+        label_column="label",
+        batch_size=3,
+        num_workers=0,
+        n_neighbors=1,
+    )
+
+    train_images = [
+        clf._prepare_image(dataset[idx]["image"], pad_to_square=False, skip_channel_information=None)
+        for idx in range(len(dataset))
     ]
+    runtime_features = clf._extract_embeddings_from_images(train_images, num_workers=0)
 
-    single = clf._extract_embedding_from_feature_output([[[1.0, 2.0], [3.0, 4.0], [7.0, 8.0]]])
-    batch = clf._extract_embeddings_from_images(
-        [Image.new("RGB", (32, 32), (0, 0, 0)), Image.new("RGB", (32, 32), (255, 255, 255))]
+    assert "features" in captured
+    assert runtime_features.shape == captured["features"].shape
+    assert np.allclose(runtime_features, captured["features"])
+
+
+def test_knn_features_do_not_drift_across_callback_train_and_inference_paths(
+    tmp_path: Path,
+    rng: np.random.Generator,
+) -> None:
+    """Callback-time, pipeline-train, and pipeline-inference features should match."""
+    model_dir = build_local_dinov2_checkpoint(tmp_path / "tiny-local-dinov2")
+    dataset, _ = get_hf_dataset(rng=rng, num_samples=9)
+    clf = pipeline(
+        "image-classification",
+        model_path=str(model_dir),
+        knn_model_path=str(tmp_path / "knn_head.joblib"),
+        device=-1,
+        top_k=2,
+    )
+    captured: dict[str, np.ndarray] = {}
+    original_fit = clf._fit_knn_from_features
+
+    def capture_fit_features(**kwargs: Any):
+        captured["train_features"] = np.array(kwargs["features"], copy=True)
+        captured["train_labels"] = np.array(kwargs["y"], copy=True)
+        return original_fit(**kwargs)
+
+    clf._fit_knn_from_features = capture_fit_features  # type: ignore[method-assign]
+    clf.train(
+        dataset=dataset,
+        split="train",
+        image_column="image",
+        label_column="label",
+        batch_size=3,
+        num_workers=0,
+        n_neighbors=1,
     )
 
-    assert single.tolist() == [1.0, 2.0, 5.0, 6.0]
-    assert batch.tolist() == [[1.0, 2.0, 5.0, 6.0], [5.0, 6.0, 9.0, 10.0]]
-
-
-def test_feature_extraction_embeddings_use_cls_only_when_configured(tmp_path: Path) -> None:
-    """Feature outputs should use only the CLS token when embedding_source='cls'."""
-    clf, _ = _build_local_pipeline(tmp_path, model_class=ViTModel, embedding_source="cls")
-    clf.feature_extraction_pipeline = lambda images, batch_size: [
-        [[1.0, 2.0], [3.0, 4.0], [7.0, 8.0]],
-        [[5.0, 6.0], [7.0, 8.0], [11.0, 12.0]],
+    prepared_images = [
+        clf._prepare_image(dataset[idx]["image"], pad_to_square=False, skip_channel_information=None)
+        for idx in range(len(dataset))
     ]
+    inference_features = clf._extract_embeddings_from_images(prepared_images, num_workers=0)
 
-    single = clf._extract_embedding_from_feature_output(
-        [[[1.0, 2.0], [3.0, 4.0], [7.0, 8.0]]],
-        embedding_source="cls",
-    )
-    batch = clf._extract_embeddings_from_images(
-        [Image.new("RGB", (32, 32), (0, 0, 0)), Image.new("RGB", (32, 32), (255, 255, 255))],
-        embedding_source="cls",
-    )
+    image_processor = AutoImageProcessor.from_pretrained(model_dir)
+    model = Dinov2Model.from_pretrained(model_dir)
 
-    assert single.tolist() == [1.0, 2.0]
-    assert batch.tolist() == [[1.0, 2.0], [5.0, 6.0]]
+    class _ProcessedDataset(TorchDataset):
+        def __len__(self) -> int:
+            return len(dataset)
+
+        def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
+            image = dataset[index]["image"]
+            encoded = image_processor(images=image, return_tensors="pt")
+            return {
+                "pixel_values": encoded["pixel_values"].squeeze(0),
+                "labels": torch.tensor(int(dataset[index]["label"]), dtype=torch.long),
+            }
+
+    trainer = type(
+        "TrainerStub",
+        (),
+        {
+            "args": type(
+                "ArgsStub",
+                (),
+                {
+                    "dataloader_num_workers": 0,
+                    "per_device_eval_batch_size": 3,
+                    "disable_tqdm": True,
+                },
+            )(),
+        },
+    )()
+    callback = KNNCallback(trainer=trainer, label_column="labels", ks=(1,))
+    callback_features, callback_labels = callback._collect_embeddings_and_labels(
+        model=model,
+        dataset=_ProcessedDataset(),
+        batch_size=3,
+        split_name="train",
+    )
+    label_names = list(dataset.features["label"].names)
+    callback_label_names = np.array([label_names[int(label)] for label in callback_labels], dtype=object)
+
+    assert "train_features" in captured
+    assert inference_features.shape == captured["train_features"].shape == callback_features.shape
+    assert np.array_equal(captured["train_labels"], callback_label_names)
+    assert np.allclose(captured["train_features"], inference_features)
+    assert np.allclose(captured["train_features"], callback_features)
 
 
 def test_pad_image_to_square_returns_square_with_black_padding() -> None:

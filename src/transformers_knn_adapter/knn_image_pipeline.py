@@ -52,14 +52,12 @@ class KNNImageClassificationPipeline(ImageClassificationPipeline):
         knn_model_path: str | Path,
         pad_to_square: bool = False,
         skip_channel_information: str | None = None,
-        embedding_source: str = "cls_mean",
         **kwargs: Any,
     ) -> None:
         super().__init__(*args, **kwargs)
         self.knn_model_path = str(knn_model_path)
         self.pad_to_square = pad_to_square
         self.skip_channel_information = skip_channel_information
-        self.embedding_source = self._resolve_embedding_source(embedding_source)
         feature_device = -1
         if isinstance(self.device, torch.device) and self.device.type == "cuda":
             feature_device = 0 if self.device.index is None else int(self.device.index)
@@ -176,23 +174,14 @@ class KNNImageClassificationPipeline(ImageClassificationPipeline):
             raise ValueError("skip_channel_information must be one of: R, G, B.")
         return skip_channel_information
 
-    def _resolve_embedding_source(self, embedding_source: str | None) -> str:
-        return Dinov2ForImageClassificationWithArcFaceLoss.resolve_embedding_source(
-            embedding_source,
-            default=cast(str, getattr(self, "embedding_source", "cls_mean")),
-        )
-
     def _sanitize_parameters(self, **kwargs: Any) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
         custom_pad = kwargs.pop("pad_to_square", None)
         custom_skip_channel = kwargs.pop("skip_channel_information", None)
-        custom_embedding_source = kwargs.pop("embedding_source", None)
         preprocess_params, forward_params, postprocess_params = super()._sanitize_parameters(**kwargs)
         if custom_pad is not None:
             preprocess_params["pad_to_square"] = bool(custom_pad)
         if custom_skip_channel is not None:
             preprocess_params["skip_channel_information"] = str(custom_skip_channel)
-        if custom_embedding_source is not None:
-            forward_params["embedding_source"] = str(custom_embedding_source)
         return preprocess_params, forward_params, postprocess_params
 
     def preprocess(self, image: Any, **preprocess_params: Any) -> dict[str, Any]:
@@ -461,26 +450,6 @@ class KNNImageClassificationPipeline(ImageClassificationPipeline):
             )
         return dataset_obj
 
-    def _extract_embedding_from_feature_output(
-        self,
-        feature_output: Any,
-        *,
-        embedding_source: str | None = None,
-    ) -> np.ndarray:
-        resolved_embedding_source = self._resolve_embedding_source(embedding_source)
-        features_np = np.asarray(feature_output, dtype=np.float32)
-        while features_np.ndim > 2 and features_np.shape[0] == 1:
-            features_np = features_np[0]
-        if features_np.ndim == 2:
-            batched_features = features_np[np.newaxis, :, :]
-            embeddings = Dinov2ForImageClassificationWithArcFaceLoss.calculate_embeddings_from_numpy(
-                batched_features,
-                embedding_source=resolved_embedding_source,
-            )
-            return embeddings[0]
-        if features_np.ndim == 1:
-            return features_np
-        raise ValueError(f"Unexpected feature output shape: {features_np.shape}")
 
     @staticmethod
     def _save_debug_transformed_samples(
@@ -498,27 +467,48 @@ class KNNImageClassificationPipeline(ImageClassificationPipeline):
             saved += 1
         return saved
 
+    def _extract_embedding_from_feature_output(self, feature_output: Any) -> np.ndarray:
+        """Derive the post-layernorm CLS embedding from nested feature outputs.
+
+        The nested ``image-feature-extraction`` pipeline does not expose
+        ``pooler_output`` directly. For DINOv2, that value is exactly the CLS
+        token taken from the post-layernorm ``last_hidden_state``. The feature
+        extraction pipeline returns those token features, so we take token 0 to
+        preserve the same embedding contract as direct model.forward(...).
+        """
+        features_np = np.asarray(feature_output, dtype=np.float32)
+        while features_np.ndim > 2 and features_np.shape[0] == 1:
+            features_np = features_np[0]
+        if features_np.ndim == 2:
+            return Dinov2ForImageClassificationWithArcFaceLoss.calculate_embeddings_from_numpy(
+                features_np[0:1, :]
+            )[0]
+        if features_np.ndim == 1:
+            return Dinov2ForImageClassificationWithArcFaceLoss.calculate_embeddings_from_numpy(features_np)
+        raise ValueError(f"Unexpected feature output shape: {features_np.shape}")
+
     def _extract_embeddings_from_images(
         self,
         images: list[Image.Image],
         *,
-        embedding_source: str | None = None,
+        num_workers: int = 0,
     ) -> np.ndarray:
-        resolved_embedding_source = self._resolve_embedding_source(embedding_source)
-        raw_features = self.feature_extraction_pipeline(images, batch_size=len(images))
+        raw_features = self.feature_extraction_pipeline(
+            images,
+            batch_size=len(images),
+            num_workers=num_workers,
+        )
+        if not isinstance(raw_features, (list, np.ndarray)):
+            raw_features = list(raw_features)
         features_np = np.asarray(raw_features, dtype=np.float32)
-        # Some HF backends return an extra singleton axis: (B, 1, T, D).
+        # HF may return an extra singleton axis: (B, 1, T, D). Token 0 still corresponds
+        # to the post-layernorm CLS embedding, i.e. the same value as ``pooler_output``.
         if features_np.ndim == 4 and features_np.shape[1] == 1:
             features_np = features_np[:, 0, :, :]
         if features_np.ndim == 3:
-            return Dinov2ForImageClassificationWithArcFaceLoss.calculate_embeddings_from_numpy(
-                features_np,
-                embedding_source=resolved_embedding_source,
-            )
+            return features_np[:, 0, :].astype(np.float32, copy=False)
         if features_np.ndim == 2:
-            if len(images) == 1:
-                return features_np
-            return features_np
+            return features_np.astype(np.float32, copy=False)
         raise ValueError(
             "Expected 2D/3D features (or 4D with singleton axis) from extraction pipeline, "
             f"got shape {features_np.shape}"
@@ -538,11 +528,9 @@ class KNNImageClassificationPipeline(ImageClassificationPipeline):
         skip_channel_information: str | None,
         debug_save_transformed_samples_dir: str | Path | None = None,
         debug_save_transformed_samples_count: int = 0,
-        embedding_source: str = "cls_mean",
     ) -> tuple[np.ndarray, np.ndarray, np.memmap | None, str | None, int]:
         """Extract embeddings and labels, optionally using memmap storage for known sample counts."""
         self.model.eval()
-        resolved_embedding_source = self._resolve_embedding_source(embedding_source)
         embedding_batches: list[np.ndarray] = []
         embeddings_mm: np.memmap | None = None
         memmap_path: str | None = None
@@ -587,11 +575,10 @@ class KNNImageClassificationPipeline(ImageClassificationPipeline):
                     prefix="train",
                 )
                 logger.info("Saved %d transformed train debug samples to %s", saved, debug_save_transformed_samples_dir)
-            feature_iter = self.feature_extraction_pipeline(
-                KeyDataset(transformed_dataset, image_column),
-                batch_size=batch_size,
-                num_workers=num_workers,
-            )
+            def image_batch_iter() -> Any:
+                for start in range(0, len(transformed_dataset), batch_size):
+                    batch_rows = transformed_dataset[start : min(start + batch_size, len(transformed_dataset))]
+                    yield cast(list[Image.Image], batch_rows[image_column])
         else:
             dataset_for_iter = dataset_obj.take(max_samples) if max_samples is not None else dataset_obj
             total_samples = max_samples
@@ -600,7 +587,8 @@ class KNNImageClassificationPipeline(ImageClassificationPipeline):
                     "debug_save_transformed_samples_* for train is currently supported only for non-streaming HFDataset."
                 )
 
-            def image_iter() -> Any:
+            def image_batch_iter() -> Any:
+                batch: list[Image.Image] = []
                 for row in dataset_for_iter:
                     labels.append(self._normalize_label(row[label_column], label_names))
                     image = self._prepare_image(
@@ -608,35 +596,33 @@ class KNNImageClassificationPipeline(ImageClassificationPipeline):
                         pad_to_square=pad_to_square,
                         skip_channel_information=skip_channel_information,
                     )
-                    yield image
+                    batch.append(image)
+                    if len(batch) == batch_size:
+                        yield batch
+                        batch = []
+                if batch:
+                    yield batch
 
-            feature_iter = self.feature_extraction_pipeline(
-                image_iter(),
-                batch_size=batch_size,
-                num_workers=num_workers,
-            )
-
-        for feature_output in tqdm(feature_iter, total=total_samples, desc="Extracting train embeddings"):
-            embedding = self._extract_embedding_from_feature_output(
-                feature_output,
-                embedding_source=resolved_embedding_source,
-            ).reshape(1, -1)
-            loaded += 1
+        total_batches = None if total_samples is None else math.ceil(total_samples / batch_size)
+        for image_batch in tqdm(image_batch_iter(), total=total_batches, desc="Extracting train embeddings"):
+            embeddings = self._extract_embeddings_from_images(image_batch, num_workers=num_workers)
+            batch_loaded = embeddings.shape[0]
+            loaded += batch_loaded
             if total_samples is not None:
                 if embeddings_mm is None:
                     with tempfile.NamedTemporaryFile(prefix="knn_emb_", suffix=".mmap", delete=False) as f:
                         memmap_path = f.name
                     embeddings_mm = np.memmap(
                         memmap_path,
-                        dtype=embedding.dtype,
+                        dtype=embeddings.dtype,
                         mode="w+",
-                        shape=(int(total_samples), embedding.shape[1]),
+                        shape=(int(total_samples), embeddings.shape[1]),
                     )
                     logger.info("Using memory-mapped embedding storage at %s", memmap_path)
-                embeddings_mm[write_idx] = embedding[0]
-                write_idx += 1
+                embeddings_mm[write_idx : write_idx + batch_loaded] = embeddings
+                write_idx += batch_loaded
             else:
-                embedding_batches.append(embedding)
+                embedding_batches.append(embeddings)
 
         if loaded == 0:
             raise ValueError("Dataset is empty; cannot train KNN.")
@@ -783,7 +769,6 @@ class KNNImageClassificationPipeline(ImageClassificationPipeline):
         grid_search_scoring: str | None = None,
         pad_to_square: bool | None = None,
         skip_channel_information: str | None = None,
-        embedding_source: str | None = None,
         debug_save_transformed_samples_dir: str | Path | None = None,
         debug_save_transformed_samples_count: int = 0,
         save_knn_model_path: str | Path | None = None,
@@ -829,7 +814,6 @@ class KNNImageClassificationPipeline(ImageClassificationPipeline):
             raise ValueError("pre_shuffle is only supported when streaming=False.")
         resolved_pad_to_square = self._resolve_pad_to_square(pad_to_square)
         resolved_skip_channel_information = self._resolve_skip_channel_information(skip_channel_information)
-        resolved_embedding_source = self._resolve_embedding_source(embedding_source)
 
         logger.info(
             "Starting KNN training: split=%s image_column=%s label_column=%s batch_size=%d n_neighbors=%d streaming=%s stratified=%s pre_shuffle=%s shuffle=%s shuffle_seed=%d max_samples=%s",
@@ -887,7 +871,6 @@ class KNNImageClassificationPipeline(ImageClassificationPipeline):
             skip_channel_information=resolved_skip_channel_information,
             debug_save_transformed_samples_dir=debug_save_transformed_samples_dir,
             debug_save_transformed_samples_count=debug_save_transformed_samples_count,
-            embedding_source=resolved_embedding_source,
         )
 
         try:
@@ -944,7 +927,6 @@ class KNNImageClassificationPipeline(ImageClassificationPipeline):
         positive_classes_population_ratio: float | None = None,
         pad_to_square: bool | None = None,
         skip_channel_information: str | None = None,
-        embedding_source: str | None = None,
         debug_save_transformed_samples_dir: str | Path | None = None,
         debug_save_transformed_samples_count: int = 0,
         reid_cmc_ranks: tuple[int, ...] = (1, 5, 10),
@@ -983,7 +965,6 @@ class KNNImageClassificationPipeline(ImageClassificationPipeline):
             )
         resolved_pad_to_square = self._resolve_pad_to_square(pad_to_square)
         resolved_skip_channel_information = self._resolve_skip_channel_information(skip_channel_information)
-        resolved_embedding_source = self._resolve_embedding_source(embedding_source)
         dataset_obj = self._resolve_dataset(
             dataset=dataset,
             split=split,
@@ -1101,8 +1082,7 @@ class KNNImageClassificationPipeline(ImageClassificationPipeline):
                 top_k=eval_top_k,
                 pad_to_square=resolved_pad_to_square,
                 skip_channel_information=resolved_skip_channel_information,
-                embedding_source=resolved_embedding_source,
-            )
+                )
             total = max_samples
             for idx, pred in enumerate(tqdm(pred_iter, total=total, desc="Evaluating")):
                 true_label = true_labels[idx]
@@ -1145,19 +1125,17 @@ class KNNImageClassificationPipeline(ImageClassificationPipeline):
         logger.info("Classification report:\n%s", report_text)
         return metrics
 
-    def _extract_embeddings(self, model_outputs: Any, *, embedding_source: str | None = None) -> torch.Tensor:
-        """Extract a 2D embedding tensor from transformer model outputs."""
-        resolved_embedding_source = self._resolve_embedding_source(embedding_source)
-        if getattr(model_outputs, "last_hidden_state", None) is not None:
-            sequence_output = cast(torch.Tensor, model_outputs.last_hidden_state)
-            embeddings = Dinov2ForImageClassificationWithArcFaceLoss.calculate_embeddings(
-                sequence_output,
-                embedding_source=resolved_embedding_source,
-            )
-        elif getattr(model_outputs, "pooler_output", None) is not None and resolved_embedding_source == "cls":
-            embeddings = cast(torch.Tensor, model_outputs.pooler_output)
-        else:
-            raise ValueError("Model outputs do not contain hidden states suitable for embedding extraction.")
+    def _extract_embeddings(self, model_outputs: Any) -> torch.Tensor:
+        """Extract pooled embeddings from direct model outputs.
+
+        Outside the nested feature-extraction pipeline, the package uses the
+        explicit ``pooler_output`` field so every non-pipeline path shares the
+        same contract.
+        """
+        pooled_output = getattr(model_outputs, "pooler_output", None)
+        if pooled_output is None:
+            raise ValueError("Model outputs must expose pooler_output for embedding extraction.")
+        embeddings = cast(torch.Tensor, pooled_output)
         embeddings = embeddings.flatten(start_dim=1)
         if embeddings.ndim != 2:
             raise ValueError(f"Expected 2D embeddings, got shape {tuple(embeddings.shape)}")
@@ -1166,14 +1144,13 @@ class KNNImageClassificationPipeline(ImageClassificationPipeline):
     def _forward(self, model_inputs: dict[str, Any], **forward_params: Any) -> Any:
         if self.knn_model is None:
             raise ValueError("KNN head is not loaded. Provide knn_model_path or call train(...) first.")
-        resolved_embedding_source = self._resolve_embedding_source(forward_params.pop("embedding_source", None))
         del forward_params
         prepared_images = model_inputs["prepared_image"]
         if isinstance(prepared_images, list):
             images = cast(list[Image.Image], prepared_images)
         else:
             images = [cast(Image.Image, prepared_images)]
-        embeddings_np = self._extract_embeddings_from_images(images, embedding_source=resolved_embedding_source)
+        embeddings_np = self._extract_embeddings_from_images(images)
         probs_np = self.knn_model.predict_proba(embeddings_np)
         probs = torch.from_numpy(np.asarray(probs_np, dtype=np.float32))
         return {"probs": probs}
@@ -1265,9 +1242,8 @@ def _resolve_cli_image_options(args: argparse.Namespace) -> tuple[bool, str | No
     return pad_to_square, skip_channel_information
 
 
-def _build_pipeline_from_args(args: argparse.Namespace) -> tuple[KNNImageClassificationPipeline, bool, str | None, str]:
+def _build_pipeline_from_args(args: argparse.Namespace) -> tuple[KNNImageClassificationPipeline, bool, str | None]:
     pad_to_square, skip_channel_information = _resolve_cli_image_options(args)
-    embedding_source = cast(str, getattr(args, "embedding_source", "cls_mean"))
     clf = pipeline(
         "image-classification",
         model_path=args.model,
@@ -1276,15 +1252,14 @@ def _build_pipeline_from_args(args: argparse.Namespace) -> tuple[KNNImageClassif
         top_k=args.top_k,
         pad_to_square=pad_to_square,
         skip_channel_information=skip_channel_information,
-        embedding_source=embedding_source,
     )
-    return clf, pad_to_square, skip_channel_information, embedding_source
+    return clf, pad_to_square, skip_channel_information
 
 
 def _train_pipeline_from_args(args: argparse.Namespace) -> KNNImageClassificationPipeline:
     """Build and train a pipeline instance from parsed CLI arguments."""
     _validate_cli_train_args(args)
-    clf, pad_to_square, skip_channel_information, embedding_source = _build_pipeline_from_args(args)
+    clf, pad_to_square, skip_channel_information = _build_pipeline_from_args(args)
 
     logger.info(
         "CLI train using dataset=%s split=%s image_column=%s label_column=%s",
@@ -1314,7 +1289,6 @@ def _train_pipeline_from_args(args: argparse.Namespace) -> KNNImageClassificatio
         grid_search_scoring=args.grid_search_scoring,
         pad_to_square=pad_to_square,
         skip_channel_information=skip_channel_information,
-        embedding_source=embedding_source,
         debug_save_transformed_samples_dir=args.debug_save_transformed_samples_dir,
         debug_save_transformed_samples_count=args.debug_save_transformed_samples_count,
         save_knn_model_path=args.knn_model_path,
@@ -1333,20 +1307,18 @@ def _run_cli_infer(args: argparse.Namespace) -> None:
     """Handle the `infer` CLI command using an already-trained KNN model."""
     if args.inference_batch_size <= 0:
         raise ValueError("--inference-batch-size must be > 0.")
-    clf, pad_to_square, skip_channel_information, embedding_source = _build_pipeline_from_args(args)
+    clf, pad_to_square, skip_channel_information = _build_pipeline_from_args(args)
     image_input = args.image
     image_batch = [image_input for _ in range(args.inference_batch_size)]
     single_result = clf(
         image_input,
         pad_to_square=pad_to_square,
         skip_channel_information=skip_channel_information,
-        embedding_source=embedding_source,
     )
     batch_result = clf(
         image_batch,
         pad_to_square=pad_to_square,
         skip_channel_information=skip_channel_information,
-        embedding_source=embedding_source,
     )
     logger.info("Single-image inference input: %s", image_input)
     logger.info("Single-image inference result: %s", single_result)
@@ -1356,19 +1328,18 @@ def _run_cli_infer(args: argparse.Namespace) -> None:
 
 def _run_cli_predict(args: argparse.Namespace) -> None:
     """Handle the `predict` CLI command."""
-    clf, pad_to_square, skip_channel_information, embedding_source = _build_pipeline_from_args(args)
+    clf, pad_to_square, skip_channel_information = _build_pipeline_from_args(args)
     result = clf(
         args.image,
         pad_to_square=pad_to_square,
         skip_channel_information=skip_channel_information,
-        embedding_source=embedding_source,
     )
     logger.info("Prediction result: %s", result)
 
 
 def _run_cli_eval(args: argparse.Namespace) -> None:
     """Handle the `eval` CLI command."""
-    clf, pad_to_square, skip_channel_information, embedding_source = _build_pipeline_from_args(args)
+    clf, pad_to_square, skip_channel_information = _build_pipeline_from_args(args)
     metrics = clf.evaluate(
         dataset=args.dataset,
         split=args.split,
@@ -1388,7 +1359,6 @@ def _run_cli_eval(args: argparse.Namespace) -> None:
         positive_classes_population_ratio=args.positive_classes_population_ratio,
         pad_to_square=pad_to_square,
         skip_channel_information=skip_channel_information,
-        embedding_source=embedding_source,
         debug_save_transformed_samples_dir=args.debug_save_transformed_samples_dir,
         debug_save_transformed_samples_count=args.debug_save_transformed_samples_count,
         reid_cmc_ranks=tuple(args.reid_cmc_ranks),
@@ -1464,12 +1434,6 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="GridSearchCV scoring metric (required with --grid-search).",
     )
     train_parser.add_argument("--top-k", type=int, default=2, help="Top-k at inference time.")
-    train_parser.add_argument(
-        "--embedding-source",
-        choices=["cls", "cls_mean"],
-        default="cls_mean",
-        help="Embedding reduction used for KNN features: CLS only or CLS plus mean patch tokens.",
-    )
     train_parser.add_argument("--device", type=int, default=-1, help="Transformers device index (-1 for CPU).")
     train_parser.add_argument(
         "--pad-to-square",
@@ -1501,12 +1465,6 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     infer_parser.add_argument("--model", required=True, help="HF model id/path for feature extraction.")
     infer_parser.add_argument("--knn-model-path", required=True, help="Path to save/load KNN model (.joblib).")
     infer_parser.add_argument("--top-k", type=int, default=3, help="Top-k predictions.")
-    infer_parser.add_argument(
-        "--embedding-source",
-        choices=["cls", "cls_mean"],
-        default="cls_mean",
-        help="Embedding reduction used for KNN features: CLS only or CLS plus mean patch tokens.",
-    )
     infer_parser.add_argument("--device", type=int, default=-1, help="Transformers device index (-1 for CPU).")
     infer_parser.add_argument(
         "--pad-to-square",
@@ -1536,12 +1494,6 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     predict_parser.add_argument("--knn-model-path", required=True, help="Path to trained KNN model (.joblib).")
     predict_parser.add_argument("--image", required=True, help="Image path/URL accepted by transformers image pipeline.")
     predict_parser.add_argument("--top-k", type=int, default=3, help="Top-k predictions.")
-    predict_parser.add_argument(
-        "--embedding-source",
-        choices=["cls", "cls_mean"],
-        default="cls_mean",
-        help="Embedding reduction used for KNN features: CLS only or CLS plus mean patch tokens.",
-    )
     predict_parser.add_argument("--device", type=int, default=-1, help="Transformers device index (-1 for CPU).")
     predict_parser.add_argument(
         "--pad-to-square",
@@ -1614,12 +1566,6 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     eval_parser.add_argument("--top-k", type=int, default=1, help="Top-k predictions (evaluation uses top-1).")
-    eval_parser.add_argument(
-        "--embedding-source",
-        choices=["cls", "cls_mean"],
-        default="cls_mean",
-        help="Embedding reduction used for KNN features: CLS only or CLS plus mean patch tokens.",
-    )
     eval_parser.add_argument("--device", type=int, default=-1, help="Transformers device index (-1 for CPU).")
     eval_parser.add_argument(
         "--pad-to-square",

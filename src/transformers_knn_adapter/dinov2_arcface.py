@@ -28,7 +28,6 @@ class Dinov2ForImageClassificationWithArcFaceLoss(Dinov2ForImageClassification):
         super().__init__(config)
         embedding_size = self.get_embedding_size_from_model_conf(config)
         self.classifier = nn.Identity()
-        self.embedding_source = self._resolve_embedding_source(config)
         self.arcface_margin = float(getattr(config, "arcface_margin", 28.6))
         self.arcface_scale = float(getattr(config, "arcface_scale", 64.0))
         self.use_focal_loss = bool(getattr(config, "use_focal_loss", False))
@@ -92,25 +91,8 @@ class Dinov2ForImageClassificationWithArcFaceLoss(Dinov2ForImageClassification):
         )
 
     @staticmethod
-    def resolve_embedding_source(embedding_source: str | None, *, default: str = "cls_mean") -> str:
-        resolved = default if embedding_source is None else str(embedding_source)
-        if resolved not in {"cls", "cls_mean"}:
-            raise ValueError("embedding_source must be one of: cls, cls_mean.")
-        return resolved
-
-    @staticmethod
-    def _resolve_embedding_source(config: Any) -> str:
-        return Dinov2ForImageClassificationWithArcFaceLoss.resolve_embedding_source(
-            getattr(config, "embedding_source", None)
-        )
-
-    @staticmethod
     def get_embedding_size_from_model_conf(config: Any) -> int:
-        hidden_size = int(getattr(config, "hidden_size"))
-        embedding_source = Dinov2ForImageClassificationWithArcFaceLoss._resolve_embedding_source(config)
-        if embedding_source == "cls":
-            return hidden_size
-        return hidden_size * 2
+        return int(getattr(config, "hidden_size"))
 
     def _compute_classification_loss(self, logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
         if not self.use_focal_loss:
@@ -168,50 +150,26 @@ class Dinov2ForImageClassificationWithArcFaceLoss(Dinov2ForImageClassification):
 
     @staticmethod
     def calculate_embeddings(
-        sequence_output: torch.Tensor,
-        embedding_source: str = "cls_mean",
+        pooled_output: torch.Tensor,
     ) -> torch.Tensor:
-        embedding_source = Dinov2ForImageClassificationWithArcFaceLoss.resolve_embedding_source(embedding_source)
-        cls_token = sequence_output[:, 0]
-        if embedding_source == "cls":
-            return cls_token
-        patch_tokens = sequence_output[:, 1:]
-        if patch_tokens.shape[1] == 0:
-            patch_mean = torch.zeros_like(cls_token)
-        else:
-            patch_mean = patch_tokens.mean(dim=1)
-        return torch.cat([cls_token, patch_mean], dim=1)
+        return pooled_output
 
     @staticmethod
     def calculate_embeddings_from_numpy(
-        sequence_output: np.ndarray,
-        embedding_source: str = "cls_mean",
+        pooled_output: np.ndarray,
     ) -> np.ndarray:
-        embedding_source = Dinov2ForImageClassificationWithArcFaceLoss.resolve_embedding_source(embedding_source)
-        cls_token = sequence_output[:, 0, :].astype(np.float32, copy=False)
-        if embedding_source == "cls":
-            return cls_token
-        if sequence_output.shape[1] == 1:
-            patch_mean = np.zeros_like(cls_token)
-        else:
-            patch_mean = sequence_output[:, 1:, :].mean(axis=1, dtype=np.float32)
-        return np.concatenate([cls_token, patch_mean], axis=1)
+        return pooled_output.astype(np.float32, copy=False)
 
     @staticmethod
     def extract_embeddings_from_image_classifier_output(
-        model_output: ImageClassifierOutput,
-        embedding_source: str = "cls_mean",
+        model_output: Any,
     ) -> torch.Tensor:
-        hidden_states = model_output.hidden_states
-        if hidden_states is None or len(hidden_states) == 0:
-            raise ValueError(
-                "ImageClassifierOutput.hidden_states must be populated to extract embeddings. "
-                "Call the model with output_hidden_states=True."
-            )
-        sequence_output = hidden_states[-1]
-        return Dinov2ForImageClassificationWithArcFaceLoss.calculate_embeddings(
-            sequence_output,
-            embedding_source=embedding_source,
+        pooled_output = getattr(model_output, "pooler_output", None)
+        if pooled_output is not None:
+            return Dinov2ForImageClassificationWithArcFaceLoss.calculate_embeddings(pooled_output)
+
+        raise ValueError(
+            "Model output must expose pooler_output to extract embeddings."
         )
 
     def forward(
@@ -222,15 +180,17 @@ class Dinov2ForImageClassificationWithArcFaceLoss(Dinov2ForImageClassification):
     ) -> ImageClassifierOutput:
         outputs = self.dinov2(pixel_values, **kwargs)
 
-        sequence_output = outputs.last_hidden_state
-        embeddings = self.calculate_embeddings(sequence_output, embedding_source=self.embedding_source)
+        embeddings = self.calculate_embeddings(outputs.pooler_output)
 
         loss, _training_logits = self.compute_arcface_loss_and_logits(embeddings=embeddings, labels=labels)
         logits = self.compute_inference_logits(embeddings)
 
-        return ImageClassifierOutput(
+        output = ImageClassifierOutput(
             loss=cast(Any, loss),
             logits=cast(Any, logits),
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
         )
+        setattr(output, "last_hidden_state", outputs.last_hidden_state)
+        setattr(output, "pooler_output", outputs.pooler_output)
+        return output

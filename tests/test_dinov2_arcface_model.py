@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 import torch.nn.functional as F
-from transformers import Dinov2Config, Dinov2ForImageClassification
+from transformers import Dinov2Config, Dinov2ForImageClassification, Dinov2Model
 from transformers.modeling_outputs import ImageClassifierOutput
 from transformers.trainer_callback import TrainerControl, TrainerState
 
@@ -87,7 +87,7 @@ def test_dinov2_arcface_model_returns_scaled_cosine_logits_without_labels() -> N
     assert torch.isfinite(outputs.logits).all()
 
 
-def test_get_embedding_size_from_model_conf_matches_cls_plus_patch_mean() -> None:
+def test_get_embedding_size_from_model_conf_matches_hidden_size() -> None:
     config = Dinov2Config(
         image_size=32,
         patch_size=16,
@@ -98,110 +98,36 @@ def test_get_embedding_size_from_model_conf_matches_cls_plus_patch_mean() -> Non
         intermediate_size=48,
         num_labels=4,
     )
-
-    embedding_size = Dinov2ForImageClassificationWithArcFaceLoss.get_embedding_size_from_model_conf(config)
-
-    assert embedding_size == 48
-
-
-def test_get_embedding_size_from_model_conf_supports_cls_only() -> None:
-    config = Dinov2Config(
-        image_size=32,
-        patch_size=16,
-        num_channels=3,
-        hidden_size=24,
-        num_hidden_layers=2,
-        num_attention_heads=4,
-        intermediate_size=48,
-        num_labels=4,
-    )
-    config.embedding_source = "cls"
 
     embedding_size = Dinov2ForImageClassificationWithArcFaceLoss.get_embedding_size_from_model_conf(config)
 
     assert embedding_size == 24
 
 
-def test_calculate_embeddings_uses_cls_plus_mean_patch_tokens() -> None:
-    sequence_output = torch.tensor(
-        [
-            [
-                [1.0, 2.0],
-                [3.0, 4.0],
-                [5.0, 6.0],
-            ]
-        ]
-    )
-
-    embeddings = Dinov2ForImageClassificationWithArcFaceLoss.calculate_embeddings(sequence_output)
-
-    assert embeddings.tolist() == [[1.0, 2.0, 4.0, 5.0]]
-
-
-def test_calculate_embeddings_supports_cls_only() -> None:
-    sequence_output = torch.tensor(
-        [
-            [
-                [1.0, 2.0],
-                [3.0, 4.0],
-                [5.0, 6.0],
-            ]
-        ]
-    )
-
-    embeddings = Dinov2ForImageClassificationWithArcFaceLoss.calculate_embeddings(
-        sequence_output,
-        embedding_source="cls",
-    )
+def test_calculate_embeddings_returns_pooler_output() -> None:
+    pooled_output = torch.tensor([[1.0, 2.0]])
+    embeddings = Dinov2ForImageClassificationWithArcFaceLoss.calculate_embeddings(pooled_output)
 
     assert embeddings.tolist() == [[1.0, 2.0]]
 
 
-def test_extract_embeddings_from_image_classifier_output_uses_last_hidden_state_entry() -> None:
-    sequence_output = torch.tensor(
-        [
-            [
-                [1.0, 2.0],
-                [3.0, 4.0],
-                [5.0, 6.0],
-            ]
-        ]
-    )
-    outputs = ImageClassifierOutput(hidden_states=(torch.zeros_like(sequence_output), sequence_output))
+def test_extract_embeddings_from_image_classifier_output_uses_pooler_output() -> None:
+    outputs = ImageClassifierOutput()
+    outputs.pooler_output = torch.tensor([[1.0, 2.0]])
 
     embeddings = Dinov2ForImageClassificationWithArcFaceLoss.extract_embeddings_from_image_classifier_output(outputs)
 
-    assert embeddings.tolist() == [[1.0, 2.0, 4.0, 5.0]]
-
-
-def test_extract_embeddings_from_image_classifier_output_supports_cls_only() -> None:
-    sequence_output = torch.tensor(
-        [
-            [
-                [1.0, 2.0],
-                [3.0, 4.0],
-                [5.0, 6.0],
-            ]
-        ]
-    )
-    outputs = ImageClassifierOutput(hidden_states=(torch.zeros_like(sequence_output), sequence_output))
-
-    embeddings = Dinov2ForImageClassificationWithArcFaceLoss.extract_embeddings_from_image_classifier_output(
-        outputs,
-        embedding_source="cls",
-    )
-
     assert embeddings.tolist() == [[1.0, 2.0]]
 
 
-def test_extract_embeddings_from_image_classifier_output_requires_hidden_states() -> None:
+def test_extract_embeddings_from_image_classifier_output_requires_post_layernorm_outputs() -> None:
     outputs = ImageClassifierOutput()
 
-    with pytest.raises(ValueError, match="output_hidden_states=True"):
+    with pytest.raises(ValueError, match="must expose pooler_output"):
         Dinov2ForImageClassificationWithArcFaceLoss.extract_embeddings_from_image_classifier_output(outputs)
 
 
-def test_extract_embeddings_from_dinov2_for_image_classification_output() -> None:
+def test_extract_embeddings_from_dinov2_for_image_classification_output_uses_post_layernorm_tokens() -> None:
     config = Dinov2Config(
         image_size=32,
         patch_size=16,
@@ -215,18 +141,17 @@ def test_extract_embeddings_from_dinov2_for_image_classification_output() -> Non
     model = Dinov2ForImageClassification(config)
     pixel_values = torch.randn(2, 3, 32, 32)
 
-    outputs = model(pixel_values=pixel_values, output_hidden_states=True)
-    embeddings = Dinov2ForImageClassificationWithArcFaceLoss.extract_embeddings_from_image_classifier_output(outputs)
-    expected = Dinov2ForImageClassificationWithArcFaceLoss.calculate_embeddings(outputs.hidden_states[-1])
+    backbone_outputs = model.dinov2(pixel_values=pixel_values, output_hidden_states=True)
+    embeddings = Dinov2ForImageClassificationWithArcFaceLoss.extract_embeddings_from_image_classifier_output(
+        backbone_outputs
+    )
+    expected = Dinov2ForImageClassificationWithArcFaceLoss.calculate_embeddings(backbone_outputs.pooler_output)
 
-    assert outputs.hidden_states is not None
-    assert embeddings.shape == (2, 48)
+    assert embeddings.shape == (2, 24)
     assert torch.allclose(embeddings, expected)
 
 
-def test_model_supports_cls_embedding_source() -> None:
-    _require_pml()
-
+def test_dinov2_post_layernorm_outputs_match_cls_token_and_not_hidden_state_tail() -> None:
     config = Dinov2Config(
         image_size=32,
         patch_size=16,
@@ -237,15 +162,59 @@ def test_model_supports_cls_embedding_source() -> None:
         intermediate_size=48,
         num_labels=4,
     )
-    config.embedding_source = "cls"
-
-    model = Dinov2ForImageClassificationWithArcFaceLoss(config)
     pixel_values = torch.randn(2, 3, 32, 32)
 
-    outputs = model(pixel_values=pixel_values)
+    model = Dinov2Model(config)
+    outputs = model(pixel_values=pixel_values, output_hidden_states=True)
 
-    assert outputs.logits.shape == (2, 4)
-    assert model.arcface_loss.W.shape == (24, 4)
+    assert outputs.hidden_states is not None
+    assert torch.allclose(outputs.pooler_output, outputs.last_hidden_state[:, 0, :])
+    assert not torch.allclose(outputs.hidden_states[-1], outputs.last_hidden_state)
+    assert not torch.allclose(outputs.hidden_states[-1][:, 0, :], outputs.pooler_output)
+
+
+def test_checkpoint_loaded_dinov2_and_classifier_backbone_use_same_post_layernorm_embeddings(tmp_path) -> None:
+    config = Dinov2Config(
+        image_size=32,
+        patch_size=16,
+        num_channels=3,
+        hidden_size=24,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        intermediate_size=48,
+        num_labels=4,
+    )
+    checkpoint_dir = tmp_path / "dinov2-shared"
+    Dinov2ForImageClassification(config).save_pretrained(checkpoint_dir)
+
+    raw_model = Dinov2Model.from_pretrained(checkpoint_dir)
+    classifier_model = Dinov2ForImageClassification.from_pretrained(checkpoint_dir)
+    pixel_values = torch.randn(2, 3, 32, 32)
+
+    raw_outputs = raw_model(pixel_values=pixel_values, output_hidden_states=True)
+    classifier_backbone_outputs = classifier_model.dinov2(
+        pixel_values=pixel_values,
+        output_hidden_states=True,
+    )
+
+    raw_embeddings = Dinov2ForImageClassificationWithArcFaceLoss.calculate_embeddings(raw_outputs.pooler_output)
+    classifier_embeddings = Dinov2ForImageClassificationWithArcFaceLoss.calculate_embeddings(
+        classifier_backbone_outputs.pooler_output
+    )
+
+    assert raw_outputs.hidden_states is not None
+    assert classifier_backbone_outputs.hidden_states is not None
+    assert torch.allclose(raw_outputs.pooler_output, raw_outputs.last_hidden_state[:, 0, :])
+    assert torch.allclose(
+        classifier_backbone_outputs.pooler_output,
+        classifier_backbone_outputs.last_hidden_state[:, 0, :],
+    )
+    assert not torch.allclose(raw_outputs.hidden_states[-1], raw_outputs.last_hidden_state)
+    assert not torch.allclose(
+        classifier_backbone_outputs.hidden_states[-1],
+        classifier_backbone_outputs.last_hidden_state,
+    )
+    assert torch.allclose(raw_embeddings, classifier_embeddings)
 
 
 def test_compute_arcface_loss_and_logits_matches_arcface_module_forward() -> None:
