@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 This changelog is automatically managed by release-please from commits merged into `main`.
 
+## [0.7.0](https://github.com/dimidagd/transformers-knn-adapter/compare/v0.6.0...v0.7.0) (2026-03-19)
+
+
+### Features
+
+* **pipeline:** share embedding selection helpers ([6651bea](https://github.com/dimidagd/transformers-knn-adapter/commit/6651bea622dbb37512a24c99a156376f2b60d8df))
+* **pipeline:** share embedding selection helpers ([84f7907](https://github.com/dimidagd/transformers-knn-adapter/commit/84f7907b6ae7ddb1d731b3a0367bb835ddd53bcd))
+
 ## [0.6.0](https://github.com/dimidagd/transformers-knn-adapter/compare/v0.5.0...v0.6.0) (2026-03-18)
 
 
