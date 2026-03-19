@@ -36,6 +36,8 @@ from transformers.image_utils import load_image
 from transformers.pipelines import ImageClassificationPipeline
 from transformers.pipelines.pt_utils import KeyDataset
 
+from .dinov2_arcface import Dinov2ForImageClassificationWithArcFaceLoss
+
 logger = logging.getLogger(__name__)
 GRID_SEARCH_ALLOWED_SCORING = {"f1_macro", "precision_macro", "recall_macro"}
 DEFAULT_N_NEIGHBORS = 5
@@ -175,11 +177,10 @@ class KNNImageClassificationPipeline(ImageClassificationPipeline):
         return skip_channel_information
 
     def _resolve_embedding_source(self, embedding_source: str | None) -> str:
-        if embedding_source is None:
-            embedding_source = self.embedding_source
-        if embedding_source not in {"cls", "cls_mean"}:
-            raise ValueError("embedding_source must be one of: cls, cls_mean.")
-        return embedding_source
+        return Dinov2ForImageClassificationWithArcFaceLoss.resolve_embedding_source(
+            embedding_source,
+            default=cast(str, getattr(self, "embedding_source", "cls_mean")),
+        )
 
     def _sanitize_parameters(self, **kwargs: Any) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
         custom_pad = kwargs.pop("pad_to_square", None)
@@ -471,14 +472,12 @@ class KNNImageClassificationPipeline(ImageClassificationPipeline):
         while features_np.ndim > 2 and features_np.shape[0] == 1:
             features_np = features_np[0]
         if features_np.ndim == 2:
-            cls_token = features_np[0].astype(np.float32, copy=False)
-            if resolved_embedding_source == "cls":
-                return cls_token
-            if features_np.shape[0] == 1:
-                vision_mean = np.zeros_like(cls_token)
-            else:
-                vision_mean = features_np[1:].mean(axis=0)
-            return np.concatenate([cls_token, vision_mean], axis=0)
+            batched_features = features_np[np.newaxis, :, :]
+            embeddings = Dinov2ForImageClassificationWithArcFaceLoss.calculate_embeddings_from_numpy(
+                batched_features,
+                embedding_source=resolved_embedding_source,
+            )
+            return embeddings[0]
         if features_np.ndim == 1:
             return features_np
         raise ValueError(f"Unexpected feature output shape: {features_np.shape}")
@@ -512,14 +511,10 @@ class KNNImageClassificationPipeline(ImageClassificationPipeline):
         if features_np.ndim == 4 and features_np.shape[1] == 1:
             features_np = features_np[:, 0, :, :]
         if features_np.ndim == 3:
-            cls_tokens = features_np[:, 0, :]
-            if resolved_embedding_source == "cls":
-                return cls_tokens
-            if features_np.shape[1] == 1:
-                vision_means = np.zeros_like(cls_tokens)
-            else:
-                vision_means = features_np[:, 1:, :].mean(axis=1)
-            return np.concatenate([cls_tokens, vision_means], axis=1)
+            return Dinov2ForImageClassificationWithArcFaceLoss.calculate_embeddings_from_numpy(
+                features_np,
+                embedding_source=resolved_embedding_source,
+            )
         if features_np.ndim == 2:
             if len(images) == 1:
                 return features_np
@@ -1155,16 +1150,10 @@ class KNNImageClassificationPipeline(ImageClassificationPipeline):
         resolved_embedding_source = self._resolve_embedding_source(embedding_source)
         if getattr(model_outputs, "last_hidden_state", None) is not None:
             sequence_output = cast(torch.Tensor, model_outputs.last_hidden_state)
-            cls_token = sequence_output[:, 0, :]
-            if resolved_embedding_source == "cls":
-                embeddings = cls_token
-            else:
-                patch_tokens = sequence_output[:, 1:, :]
-                if patch_tokens.shape[1] == 0:
-                    patch_mean = torch.zeros_like(cls_token)
-                else:
-                    patch_mean = patch_tokens.mean(dim=1)
-                embeddings = torch.cat([cls_token, patch_mean], dim=1)
+            embeddings = Dinov2ForImageClassificationWithArcFaceLoss.calculate_embeddings(
+                sequence_output,
+                embedding_source=resolved_embedding_source,
+            )
         elif getattr(model_outputs, "pooler_output", None) is not None and resolved_embedding_source == "cls":
             embeddings = cast(torch.Tensor, model_outputs.pooler_output)
         else:

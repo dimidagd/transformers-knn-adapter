@@ -6,11 +6,31 @@ from pathlib import Path
 
 import joblib
 import numpy as np
+import torch
 from PIL import Image
 from sklearn.neighbors import KNeighborsClassifier
 from transformers import ViTConfig, ViTImageProcessor, ViTModel
 
 from transformers_knn_adapter.knn_image_pipeline import pipeline
+
+
+def extract_cls_mean_embeddings(
+    model: ViTModel,
+    processor: ViTImageProcessor,
+    images: list[Image.Image],
+) -> np.ndarray:
+    inputs = processor(images=images, return_tensors="pt")
+    with torch.no_grad():
+        outputs = model(**inputs)
+    sequence_output = outputs.last_hidden_state
+    cls_token = sequence_output[:, 0, :]
+    patch_tokens = sequence_output[:, 1:, :]
+    if patch_tokens.shape[1] == 0:
+        patch_mean = torch.zeros_like(cls_token)
+    else:
+        patch_mean = patch_tokens.mean(dim=1)
+    embeddings = torch.cat([cls_token, patch_mean], dim=1)
+    return embeddings.cpu().numpy()
 
 
 def main() -> None:
@@ -41,16 +61,20 @@ def main() -> None:
     )
     processor.save_pretrained(model_dir)
 
-    features = rng.normal(size=(4, 64))
+    train_images = [
+        Image.fromarray(
+            rng.integers(0, 255, size=(32, 32, 3), dtype=np.uint8),
+            mode="RGB",
+        )
+        for _ in range(4)
+    ]
+    features = extract_cls_mean_embeddings(model, processor, train_images)
     labels = np.array(["class_a", "class_b", "class_a", "class_b"], dtype=object)
     knn = KNeighborsClassifier(n_neighbors=1)
     knn.fit(features, labels)
     joblib.dump(knn, knn_path)
 
-    image = Image.fromarray(
-        rng.integers(0, 255, size=(32, 32, 3), dtype=np.uint8),
-        mode="RGB",
-    )
+    image = train_images[0]
     image.save(image_path)
 
     clf = pipeline(
