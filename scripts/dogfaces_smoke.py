@@ -131,12 +131,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional JSON config file containing a `freeze_schedule` list.",
     )
     parser.add_argument(
-        "--knn-embedding-source",
-        choices=("cls", "cls_mean"),
-        default="cls_mean",
-        help="Embedding reduction used by the KNN evaluation callback.",
-    )
-    parser.add_argument(
         "--disable-knn-callback",
         action="store_true",
         help="Skip attaching the KNN evaluation callback.",
@@ -342,7 +336,6 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 trainer=trainer,
                 label_column="labels",
                 ks=(1,),
-                embedding_source=args.knn_embedding_source,
             )
         )
     if config.freeze_schedule:

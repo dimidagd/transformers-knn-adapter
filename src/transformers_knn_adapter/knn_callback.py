@@ -11,10 +11,7 @@ from sklearn.preprocessing import LabelEncoder
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 from transformers import TrainerCallback
-from transformers.modeling_outputs import ImageClassifierOutput
 from transformers.utils import logging
-
-from .dinov2_arcface import Dinov2ForImageClassificationWithArcFaceLoss
 
 logger = logging.get_logger(__name__)
 
@@ -36,7 +33,6 @@ class KNNCallback(TrainerCallback):
         label_column: str = "label",
         ks: Sequence[int] = (1, 5),
         batch_size: int | None = None,
-        embedding_source: str | None = None,
         average: str = "macro",
         zero_division: float | str = np.nan,
     ) -> None:
@@ -45,30 +41,8 @@ class KNNCallback(TrainerCallback):
         self.label_column = label_column
         self.ks = tuple(int(k) for k in ks)
         self.batch_size = batch_size
-        if embedding_source is not None and embedding_source not in {"cls", "cls_mean"}:
-            raise ValueError(f"Unsupported embedding_source {embedding_source!r}. Expected 'cls' or 'cls_mean'.")
-        self.embedding_source = embedding_source
         self.average = average
         self.zero_division = zero_division
-
-    def _resolve_embedding_source(self, model: Any) -> str:
-        model_embedding_source = getattr(getattr(model, "config", None), "embedding_source", None)
-        if model_embedding_source is not None and model_embedding_source not in {"cls", "cls_mean"}:
-            raise ValueError(
-                f"Unsupported model.config.embedding_source {model_embedding_source!r}. "
-                "Expected 'cls' or 'cls_mean'."
-            )
-        callback_embedding_source = self.embedding_source
-        if callback_embedding_source is None:
-            return str(model_embedding_source or "cls_mean")
-        if model_embedding_source is not None and callback_embedding_source != model_embedding_source:
-            logger.warning(
-                "KNNCallback embedding_source=%s does not match model.config.embedding_source=%s. "
-                "KNN metrics will use the callback value.",
-                callback_embedding_source,
-                model_embedding_source,
-            )
-        return callback_embedding_source
 
     def _collate_batch(self, examples: list[dict[str, Any]]) -> tuple[torch.Tensor, torch.Tensor]:
         if any("pixel_values" not in example for example in examples):
@@ -81,30 +55,11 @@ class KNNCallback(TrainerCallback):
         return pixel_values, labels
 
     @staticmethod
-    def _extract_embeddings(model_outputs: Any, *, embedding_source: str) -> torch.Tensor:
-        if isinstance(model_outputs, ImageClassifierOutput):
-            hidden_states = model_outputs.hidden_states
-            if hidden_states is None or len(hidden_states) == 0:
-                raise ValueError(
-                    "ImageClassifierOutput.hidden_states must be populated to extract embeddings. "
-                    "Call the model with output_hidden_states=True."
-                )
-            sequence_output = hidden_states[-1]
-        elif getattr(model_outputs, "last_hidden_state", None) is not None:
-            sequence_output = model_outputs.last_hidden_state
-        elif getattr(model_outputs, "hidden_states", None) is not None:
-            hidden_states = model_outputs.hidden_states
-            if hidden_states is None or len(hidden_states) == 0:
-                raise ValueError("hidden_states are empty; cannot extract embeddings")
-            sequence_output = hidden_states[-1]
-        else:
-            raise ValueError("Model outputs do not contain hidden states suitable for KNN embedding extraction.")
-
-        if embedding_source == "cls":
-            return sequence_output[:, 0, :]
-        if embedding_source == "cls_mean":
-            return Dinov2ForImageClassificationWithArcFaceLoss.calculate_embeddings(sequence_output)
-        raise ValueError(f"Unsupported embedding_source {embedding_source!r}. Expected 'cls' or 'cls_mean'.")
+    def _extract_embeddings(model_outputs: Any) -> torch.Tensor:
+        pooled_output = getattr(model_outputs, "pooler_output", None)
+        if pooled_output is not None:
+            return pooled_output
+        raise ValueError("Model outputs must expose pooler_output for KNN embedding extraction.")
 
     def _build_loader(self, dataset: Any, batch_size: int) -> DataLoader:
         num_workers = int(getattr(self.trainer.args, "dataloader_num_workers", 0))
@@ -202,7 +157,6 @@ class KNNCallback(TrainerCallback):
         dataset: Any,
         batch_size: int,
         split_name: str,
-        embedding_source: str,
     ) -> tuple[np.ndarray, np.ndarray]:
         loader = self._build_loader(dataset, batch_size)
         device = next(model.parameters()).device
@@ -221,7 +175,7 @@ class KNNCallback(TrainerCallback):
             pixel_values = pixel_values.to(device)
             with torch.no_grad():
                 outputs = model(pixel_values=pixel_values, output_hidden_states=True)
-            embeddings = self._extract_embeddings(outputs, embedding_source=embedding_source)
+            embeddings = self._extract_embeddings(outputs)
             self._ensure_finite(f"{split_name} embeddings", embeddings)
             embeddings_batches.append(embeddings.detach().cpu().numpy())
             labels_batches.append(labels.numpy())
@@ -243,11 +197,9 @@ class KNNCallback(TrainerCallback):
             raise ValueError("KNNCallback requires trainer.model, train_dataset, and eval_dataset.")
 
         batch_size = self.batch_size or int(self.trainer.args.per_device_eval_batch_size)
-        embedding_source = self._resolve_embedding_source(model)
         logger.info(
-            "Running KNN callback evaluation for ks=%s embedding_source=%s average=%s zero_division=%s batch_size=%d num_workers=%d",
+            "Running KNN callback evaluation for ks=%s average=%s zero_division=%s batch_size=%d num_workers=%d",
             self.ks,
-            embedding_source,
             self.average,
             self.zero_division,
             batch_size,
@@ -261,14 +213,12 @@ class KNNCallback(TrainerCallback):
                 dataset=train_dataset,
                 batch_size=batch_size,
                 split_name="train",
-                embedding_source=embedding_source,
             )
             eval_X, eval_y = self._collect_embeddings_and_labels(
                 model=model,
                 dataset=eval_dataset,
                 batch_size=batch_size,
                 split_name="eval",
-                embedding_source=embedding_source,
             )
         finally:
             if was_training:

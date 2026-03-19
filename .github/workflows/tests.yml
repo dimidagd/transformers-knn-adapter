@@ -122,6 +122,13 @@ jobs:
           uv run --with accelerate --with pytorch-metric-learning \
             pytest tests/test_dogfaces_smoke_integration.py -q
 
+      - name: Run ArcFace integration test
+        env:
+          RUN_DINOV2_ARCFACE_TEST: "1"
+        run: |
+          uv run --with accelerate --with pytorch-metric-learning \
+            pytest tests/test_dinov2_arcface_integration.py -q
+
   build:
     runs-on: ubuntu-latest
     env:
