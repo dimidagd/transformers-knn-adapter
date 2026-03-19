@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 This changelog is automatically managed by release-please from commits merged into `main`.
 
+## [0.8.0](https://github.com/dimidagd/transformers-knn-adapter/compare/v0.7.0...v0.8.0) (2026-03-19)
+
+
+### Features
+
+* **pipeline:** unify DINOv2 embeddings around pooled output ([d0677b1](https://github.com/dimidagd/transformers-knn-adapter/commit/d0677b171e0d2705a7cc18379a0a5805703f6bfc))
+* **pipeline:** unify DINOv2 embeddings around pooled output ([1563dee](https://github.com/dimidagd/transformers-knn-adapter/commit/1563dee80f4ab0f4c0f7afae3cbd3e8cd91f00ca))
+
 ## [0.7.0](https://github.com/dimidagd/transformers-knn-adapter/compare/v0.6.0...v0.7.0) (2026-03-19)
 
 
