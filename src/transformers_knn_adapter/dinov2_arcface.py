@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 from typing import Any, cast
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -91,11 +92,17 @@ class Dinov2ForImageClassificationWithArcFaceLoss(Dinov2ForImageClassification):
         )
 
     @staticmethod
-    def _resolve_embedding_source(config: Any) -> str:
-        embedding_source = str(getattr(config, "embedding_source", "cls_mean"))
-        if embedding_source not in {"cls", "cls_mean"}:
+    def resolve_embedding_source(embedding_source: str | None, *, default: str = "cls_mean") -> str:
+        resolved = default if embedding_source is None else str(embedding_source)
+        if resolved not in {"cls", "cls_mean"}:
             raise ValueError("embedding_source must be one of: cls, cls_mean.")
-        return embedding_source
+        return resolved
+
+    @staticmethod
+    def _resolve_embedding_source(config: Any) -> str:
+        return Dinov2ForImageClassificationWithArcFaceLoss.resolve_embedding_source(
+            getattr(config, "embedding_source", None)
+        )
 
     @staticmethod
     def get_embedding_size_from_model_conf(config: Any) -> int:
@@ -164,17 +171,31 @@ class Dinov2ForImageClassificationWithArcFaceLoss(Dinov2ForImageClassification):
         sequence_output: torch.Tensor,
         embedding_source: str = "cls_mean",
     ) -> torch.Tensor:
+        embedding_source = Dinov2ForImageClassificationWithArcFaceLoss.resolve_embedding_source(embedding_source)
         cls_token = sequence_output[:, 0]
         if embedding_source == "cls":
             return cls_token
-        if embedding_source != "cls_mean":
-            raise ValueError("embedding_source must be one of: cls, cls_mean.")
         patch_tokens = sequence_output[:, 1:]
         if patch_tokens.shape[1] == 0:
             patch_mean = torch.zeros_like(cls_token)
         else:
             patch_mean = patch_tokens.mean(dim=1)
         return torch.cat([cls_token, patch_mean], dim=1)
+
+    @staticmethod
+    def calculate_embeddings_from_numpy(
+        sequence_output: np.ndarray,
+        embedding_source: str = "cls_mean",
+    ) -> np.ndarray:
+        embedding_source = Dinov2ForImageClassificationWithArcFaceLoss.resolve_embedding_source(embedding_source)
+        cls_token = sequence_output[:, 0, :].astype(np.float32, copy=False)
+        if embedding_source == "cls":
+            return cls_token
+        if sequence_output.shape[1] == 1:
+            patch_mean = np.zeros_like(cls_token)
+        else:
+            patch_mean = sequence_output[:, 1:, :].mean(axis=1, dtype=np.float32)
+        return np.concatenate([cls_token, patch_mean], axis=1)
 
     @staticmethod
     def extract_embeddings_from_image_classifier_output(
